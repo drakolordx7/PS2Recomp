@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace ps2x::iop
 {
@@ -48,7 +49,10 @@ namespace ps2x::iop::detail
         void reset();
         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
-        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+        // sendPayload: a snapshot of the send buffer taken by the caller (offloaded nowait calls); null = read it from
+        // guest memory now.
+        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor,
+                                          const std::vector<uint8_t> *sendPayload = nullptr);
         void onSifTransfer(const SifTransfer &transfer);
         void removeServersInRange(uint32_t base, uint32_t size);
 

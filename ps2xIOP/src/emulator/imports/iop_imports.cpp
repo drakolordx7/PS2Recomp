@@ -42,6 +42,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::reset()
     {
+        m_decodeCache.clear();
         m_libraries.clear();
     }
 
@@ -54,6 +55,12 @@ namespace ps2x::iop::detail
             return std::nullopt;
 
         const uint32_t physicalPc = IopMemory::physicalAddress(pc);
+        if (const auto hit = m_decodeCache.find(physicalPc); hit != m_decodeCache.end())
+        {
+            if (hit->second.delayWord == delay)
+                return hit->second.call;
+            m_decodeCache.erase(hit);
+        }
         const uint32_t searchBegin = physicalPc > 0x10000u ? physicalPc - 0x10000u : 0u;
         for (uint32_t candidate = physicalPc & ~3u; candidate >= searchBegin + 20u; candidate -= 4u)
         {
@@ -89,11 +96,13 @@ namespace ps2x::iop::detail
             }
             if (valid)
             {
-                return IopImportCall{
+                IopImportCall call{
                     trimLibraryName(name),
                     static_cast<uint16_t>(delay & 0xFFFFu),
                     m_memory.read16(table + 8u),
                 };
+                m_decodeCache[physicalPc] = CachedImport{delay, call};
+                return call;
             }
         }
         return std::nullopt;
@@ -129,6 +138,7 @@ namespace ps2x::iop::detail
 
     bool IopImportRegistry::releaseExportTable(uint32_t address)
     {
+        m_decodeCache.clear();
         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
     }
 
@@ -184,6 +194,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        m_decodeCache.clear();
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

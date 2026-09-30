@@ -4,6 +4,9 @@
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
+#include "../iop_trace.h"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -197,7 +200,15 @@ namespace ps2x::iop::detail
             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
 
-            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
+            const bool delivered = m_host.sendSifCommand(commandId, packet.data(), packetSize);
+            if (iopSyncTraceLevel() >= 2)
+            {
+                uint32_t words[4] = {};
+                std::memcpy(words, packet.data() + 16u, std::min<uint32_t>(16u, packetSize - 16u));
+                std::fprintf(stderr, "[iop-sync] SendCmd cid=0x%x delivered=%d data=%08x %08x %08x %08x ra=0x%x\n",
+                             commandId, delivered ? 1 : 0, words[0], words[1], words[2], words[3], cpu.gpr[31]);
+            }
+            if (!delivered)
             {
                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
             }
@@ -244,9 +255,26 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
+        case 23: // sceSifGetOtherData(rd, eeSource, iopDest, size, mode): pull EE memory into IOP RAM
+        {
+            // Killzone's PSOUND_R.IRX pulls every sound bank from EE RAM this way (4 KB chunks) before uploading
+            // it to SPU2 RAM; as a no-op the banks were never loaded.
+            const uint32_t source = cpu.gpr[5];
+            const uint32_t destination = cpu.gpr[6];
+            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
+            if (size > 0 && static_cast<uint32_t>(size) <= IopMemory::RamSize)
+            {
+                std::vector<uint8_t> data(static_cast<size_t>(size));
+                if (!m_host.readGuest(source, data.data(), data.size()) ||
+                    !m_memory.writeRam(destination, data.data(), data.size()))
+                {
+                    setV0(static_cast<uint32_t>(-1));
+                    return true;
+                }
+            }
             setV0(0);
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];
@@ -273,7 +301,8 @@ namespace ps2x::iop::detail
         }
     }
 
-    RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
+    RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor,
+                                      const std::vector<uint8_t> *sendPayload)
     {
         RpcResult result{};
         const auto serverIt = m_servers.find(request.sid);
@@ -281,10 +310,28 @@ namespace ps2x::iop::detail
             return result;
 
         RpcServer &server = serverIt->second;
+        if (iopSyncTraceLevel() >= 2)
+        {
+            uint32_t words[16] = {};
+            if (sendPayload)
+                std::memcpy(words, sendPayload->data(), std::min<size_t>(sendPayload->size(), sizeof(words)));
+            else
+                (void)m_host.readGuest(request.send.address, words, std::min<uint32_t>(request.send.size, sizeof(words)));
+            std::fprintf(stderr, "[iop-sync] Rpc sid=0x%x fn=0x%x mode=%u send=%u:", request.sid, request.function,
+                         request.mode, request.send.size);
+            for (uint32_t i = 0; i < std::min<uint32_t>(16u, (request.send.size + 3u) / 4u); ++i)
+                std::fprintf(stderr, " %08x", words[i]);
+            std::fprintf(stderr, "\n");
+        }
         if (request.send.size != 0u && server.buffer != 0u)
         {
             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
-            if (copySize != 0u)
+            if (copySize != 0u && sendPayload)
+            {
+                (void)m_memory.writeRam(server.buffer, sendPayload->data(),
+                                        std::min<size_t>(copySize, sendPayload->size()));
+            }
+            else if (copySize != 0u)
             {
                 std::vector<uint8_t> payload(copySize);
                 if (m_host.readGuest(request.send.address, payload.data(), payload.size()))

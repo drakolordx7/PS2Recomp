@@ -1,6 +1,10 @@
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+#include "../../ps2_iop_async.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
@@ -339,8 +343,179 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    namespace
+    {
+        // PS2X_IOP_RPC_STATS=1: wall time the EE thread spends in SifCallRpc (all of it: argument decoding, the IOP
+        // call, the debug events, the end-function hand-off), printed with the [iop-rpc] table every 10 s.
+        struct SifCallRpcTimer
+        {
+            static bool enabled()
+            {
+                static const bool value = []() {
+                    const char *v = std::getenv("PS2X_IOP_RPC_STATS");
+                    return v && *v && v[0] != '0';
+                }();
+                return value;
+            }
+            static inline uint64_t calls = 0, nowaitCalls = 0, totalNs = 0, iopNs = 0, lastPrint = 0, busyCalls = 0;
+            static uint64_t now()
+            {
+                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now().time_since_epoch())
+                                                 .count());
+            }
+            uint64_t t0 = 0;
+            bool nowait = false;
+            SifCallRpcTimer() : t0(enabled() ? now() : 0u) {}
+            ~SifCallRpcTimer()
+            {
+                if (!t0)
+                    return;
+                const uint64_t t = now();
+                ++calls;
+                nowaitCalls += nowait ? 1 : 0;
+                totalNs += t - t0;
+                if (lastPrint == 0)
+                    lastPrint = t;
+                if (t - lastPrint >= 10000000000ull)
+                {
+                    lastPrint = t;
+                    std::fprintf(stderr, "[iop-rpc] EE SifCallRpc: calls=%llu nowait=%llu total=%.1fms (of which IOP handleRpc %.1fms) avg=%.1fus, calls on a still-busy client %llu\n",
+                                 static_cast<unsigned long long>(calls), static_cast<unsigned long long>(nowaitCalls),
+                                 totalNs / 1e6, iopNs / 1e6, totalNs / 1e3 / static_cast<double>(calls),
+                                 static_cast<unsigned long long>(busyCalls));
+                }
+            }
+        };
+    }
+
+    namespace
+    {
+        // A nowait call whose server function runs on the IOP thread (ps2_iop_async.h). Everything the EE needs to
+        // finish it later, from the posted-work queue: the same steps as the inline path of SifCallRpc (completion
+        // semaphores, reply fix-ups, end function, client state), in the same order.
+        struct OffloadedRpc
+        {
+            uint32_t clientPtr = 0, serverPtr = 0, sid = 0, rpcNum = 0, mode = 0;
+            uint32_t sendBuf = 0, sendSize = 0, receiveBuffer = 0, receiveSize = 0;
+            uint32_t endFunction = 0, endParameter = 0, completionSemaphore = 0, gp = 0;
+            uint32_t callerPc = 0, callerRa = 0;
+        };
+
+        void finishOffloadedRpc(PS2Runtime *runtime, uint8_t *rdram, const OffloadedRpc &call,
+                                const ps2x::iop::RpcResult &iopResult)
+        {
+            if (iopResult.signalNowaitCompletion)
+            {
+                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
+            }
+            if (iopResult.signalCompletion)
+            {
+                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
+            }
+
+            const bool handled = iopResult.handled;
+            const uint32_t resultPointer = iopResult.resultAddress;
+            bool copiedFallback = false;
+            bool zeroedFallback = false;
+            if (call.receiveBuffer != 0u && call.receiveSize != 0u)
+            {
+                if (handled && resultPointer != 0u && resultPointer != call.receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, call.receiveBuffer, resultPointer, call.receiveSize);
+                }
+                else if (!handled && call.sendBuf != 0u && call.sendSize != 0u && call.sendBuf != call.receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, call.receiveBuffer, call.sendBuf, std::min(call.sendSize, call.receiveSize));
+                    copiedFallback = true;
+                }
+                else if (!handled)
+                {
+                    rpcZeroRdram(rdram, call.receiveBuffer, call.receiveSize);
+                    zeroedFallback = true;
+                }
+            }
+
+            auto completeClient = [=](bool callbackCompleted)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                    g_rpc_clients[call.clientPtr].busy = false;
+                }
+                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", nullptr, runtime);
+                event.pc = call.callerPc;
+                event.ra = call.callerRa;
+                event.clientPtr = call.clientPtr;
+                event.serverPtr = call.serverPtr;
+                event.sid = call.sid;
+                event.rpcNum = call.rpcNum;
+                event.mode = call.mode;
+                event.sendBuf = call.sendBuf;
+                event.sendSize = call.sendSize;
+                event.recvBuf = call.receiveBuffer;
+                event.recvSize = call.receiveSize;
+                event.resultPtr = resultPointer;
+                event.endFunc = call.endFunction;
+                event.endParam = call.endParameter;
+                event.semaId = call.completionSemaphore;
+                event.flags =
+                    kSifRpcDebugFlagNowait |
+                    (iopResult.handled ? kSifRpcDebugFlagHandledByHle : 0u) |
+                    (callbackCompleted ? kSifRpcDebugFlagCallback : 0u) |
+                    (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
+                    (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
+                    (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
+                fillRpcDebugPreview(rdram, call.sendBuf, call.sendSize, event.sendPreview, event.sendPreviewSize);
+                fillRpcDebugPreview(rdram, call.receiveBuffer, call.receiveSize, event.recvPreview, event.recvPreviewSize);
+                event.result = 0;
+#if PS2X_ENABLE_IOP_RPC_TRACE
+                if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
+                {
+                    logUnhandledRpcTrace(event);
+                }
+#endif
+                pushSifRpcDebugEvent(event);
+            };
+
+            if (call.endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
+            {
+                completeClient(call.endFunction != 0u);
+                return;
+            }
+
+            uint32_t callbackFunction = call.endFunction;
+            if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                runtime->hasFunction(callbackFunction - 0x10000u))
+            {
+                callbackFunction -= 0x10000u;
+            }
+            if (!runtime->hasFunction(callbackFunction))
+            {
+                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
+                completeClient(false);
+                return;
+            }
+
+            // On hardware the end function runs from the SIF interrupt once the IOP's reply arrives, not inside
+            // sceSifCallRpc: queue it like any other interrupt-time callback (the scheduler gives it a stack).
+            GuestInvocation callback{};
+            callback.kind = GuestInvocationKind::RpcCallback;
+            callback.context.pc = callbackFunction;
+            SET_GPR_U32(&callback.context, 4, call.endParameter);
+            SET_GPR_U32(&callback.context, 28, call.gp);
+            SET_GPR_U32(&callback.context, 29, 0u);
+            SET_GPR_U32(&callback.context, 31, 0u);
+            callback.onComplete = [completeClient](const R5900Context &, R5900Context &)
+            {
+                completeClient(true);
+            };
+            runtime->eeScheduler().queueInvocation(std::move(callback));
+        }
+    }
+
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifCallRpcTimer callTimer;
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
 
         const uint32_t clientPtr = getRegU32(ctx, 4);
@@ -487,6 +662,8 @@ namespace ps2_syscalls
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             auto &state = g_rpc_clients[clientPtr];
+            if (state.busy)
+                ++SifCallRpcTimer::busyCalls; // PS2X_IOP_RPC_STATS: a call on a client whose previous call has not completed
             state.busy = true;
             state.last_rpc = rpcNum;
             sid = state.sid;
@@ -543,7 +720,39 @@ namespace ps2_syscalls
             request.endFunction = endFunction;
             request.endParameter = endParameter;
 
+            callTimer.nowait = (mode & kSifRpcModeNowait) != 0u;
+            if (callTimer.nowait)
+            {
+                // Threaded IOP: the IOP runs the server function asynchronously, like the real one. Only calls to
+                // emulated (physical IRX) servers qualify; ps2IopRpcSubmit() declines everything else.
+                OffloadedRpc offloaded;
+                offloaded.clientPtr = clientPtr;
+                offloaded.serverPtr = serverPtr;
+                offloaded.sid = sid;
+                offloaded.rpcNum = rpcNum;
+                offloaded.mode = mode;
+                offloaded.sendBuf = sendBuf;
+                offloaded.sendSize = sendSize;
+                offloaded.receiveBuffer = receiveBuffer;
+                offloaded.receiveSize = receiveSize;
+                offloaded.endFunction = endFunction;
+                offloaded.endParameter = endParameter;
+                offloaded.completionSemaphore = completionSemaphore;
+                offloaded.gp = getRegU32(ctx, 28);
+                offloaded.callerPc = ctx->pc;
+                offloaded.callerRa = getRegU32(ctx, 31);
+                if (ps2IopRpcSubmit(request,
+                                    [runtime, rdram, offloaded](const ps2x::iop::RpcResult &result)
+                                    { finishOffloadedRpc(runtime, rdram, offloaded, result); }))
+                {
+                    setReturnS32(ctx, 0);
+                    return;
+                }
+            }
+            const uint64_t iopT0 = callTimer.t0 ? SifCallRpcTimer::now() : 0u;
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            if (callTimer.t0)
+                SifCallRpcTimer::iopNs += SifCallRpcTimer::now() - iopT0;
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)

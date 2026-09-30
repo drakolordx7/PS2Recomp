@@ -140,7 +140,7 @@ namespace ps2recomp
             case COP0_CO_TLBP:
                 return fmt::format("runtime->handleTLBP(rdram, ctx);");
             case COP0_CO_ERET:
-                return fmt::format(
+                return std::string(m_codeGenerator.m_localsMode ? "PS2_FLUSH();\n" : "") + fmt::format(
                     "if (ctx->cop0_status & 0x4) {{ \n" // Check ERL bit (bit 2)
                     "    ctx->pc = ctx->cop0_errorepc; \n"
                     "    ctx->cop0_status &= ~0x4; \n" // Clear ERL bit

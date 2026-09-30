@@ -1,4 +1,6 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_pad_provider.h"
+#include <atomic>
 #include "ps2_host_backend.h"
 #include <cstring>
 
@@ -25,10 +27,25 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+namespace
+{
+    std::atomic<PS2PadProvider> g_padProvider{nullptr};
+}
+
+void ps2SetPadProvider(PS2PadProvider provider)
+{
+    g_padProvider.store(provider, std::memory_order_release);
+}
+
+bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
+    if (PS2PadProvider provider = g_padProvider.load(std::memory_order_acquire))
+    {
+        if (provider(port, slot, data, size))
+            return true;
+    }
 
     std::memset(data, 0, 32);
     data[0] = 0x01;

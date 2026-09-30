@@ -68,6 +68,20 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+
+        // Host SPU2 (ps2x/iop/iop_host_spu2.h): the IOP cycle the hooks see is *epoch + *cycles.
+        void setCycleSource(const uint64_t *cycles, const uint64_t *epoch) noexcept
+        {
+            m_cycles = cycles;
+            m_cycleEpoch = epoch;
+        }
+        [[nodiscard]] uint64_t spu2Cycle() const noexcept
+        {
+            return (m_cycles ? *m_cycles : 0u) + (m_cycleEpoch ? *m_cycleEpoch : 0u);
+        }
+        // DMA ch4 (core 0) / ch7 (core 1) finished: clears CHCR.TR and moves MADR to the end of the transfer.
+        // Returns false if the guest had already stopped the channel (no interrupt then).
+        [[nodiscard]] bool completeSpu2Dma(int core);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -76,6 +90,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        [[nodiscard]] static bool isSpu2Register(uint32_t phys) noexcept;
+        void startSpu2Dma(uint32_t chcrAddress, uint32_t chcr);
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -87,5 +103,12 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        const uint64_t *m_cycles = nullptr;
+        const uint64_t *m_cycleEpoch = nullptr;
+        uint32_t m_spu2DmaEnd[2] = {};
     };
+
+    // Host SPU2 interrupt requests queued by iopSpu2RaiseIrq / iopSpu2DmaComplete: bit 0 = SPU2 IRQ (line 9),
+    // bit 1 = DMA ch4 end, bit 2 = DMA ch7 end. Taken (and cleared) by the emulator.
+    [[nodiscard]] uint32_t takeSpu2Pending() noexcept;
 }

@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace ps2x::iop::detail
 {
@@ -23,15 +24,24 @@ namespace ps2x::iop::detail
     {
     }
 
+    void IopKernel::rebuildThreadList()
+    {
+        m_threadList.clear();
+        for (auto &[id, thread] : m_threads)
+            m_threadList.push_back(&thread);
+    }
+
     void IopKernel::reset()
     {
         m_threads.clear();
+        m_threadList.clear();
         m_semaphores.clear();
         m_eventFlags.clear();
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_currentThread = nullptr;
+        m_outsideSemaphoreWait = 0;
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -62,6 +72,7 @@ namespace ps2x::iop::detail
             }
             const int id = thread.id;
             m_threads.emplace(id, std::move(thread));
+            rebuildThreadList();
             setV0(id);
             return true;
         }
@@ -77,6 +88,7 @@ namespace ps2x::iop::detail
             if (it->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(it->second.stackBase);
             m_threads.erase(it);
+            rebuildThreadList();
             setV0(0);
             return true;
         }
@@ -387,7 +399,16 @@ namespace ps2x::iop::detail
             }
             if (it->second.current < it->second.maximum)
                 ++it->second.current;
-            wakeOneSemaphore(id);
+            if (m_outsideSemaphoreWait == id)
+            {
+                // An RPC server function / module start routine is blocked on this semaphore (see
+                // setOutsideSemaphoreWait). It stands for the RPC server thread, which outranks the signaller:
+                // keep the count for it and end the signaller's slice so it cannot take the semaphore back first.
+                if (m_currentThread != nullptr && &cpu == &m_currentThread->cpu) // not from an interrupt handler
+                    cpu.yielded = true;
+            }
+            else
+                wakeOneSemaphore(id);
             setV0(0);
             return true;
         }
@@ -476,6 +497,12 @@ namespace ps2x::iop::detail
         if (bits == 0u)
             return false;
         return (mode & 1u) != 0u ? (event.bits & bits) != 0u : (event.bits & bits) == bits;
+    }
+
+    bool IopKernel::eventFlagSatisfied(int id, uint32_t bits, uint32_t mode) const
+    {
+        const auto event = m_eventFlags.find(id);
+        return event != m_eventFlags.end() && eventSatisfied(event->second, bits, mode);
     }
 
     void IopKernel::wakeEventWaiters(EventFlag &event)
@@ -652,6 +679,33 @@ namespace ps2x::iop::detail
         }
     }
 
+    int IopKernel::semaphoreCount(int id) const
+    {
+        const auto semaphore = m_semaphores.find(id);
+        return semaphore == m_semaphores.end() ? -1 : semaphore->second.current;
+    }
+
+    std::string IopKernel::describeThreads() const
+    {
+        static const char *const kStateNames[] = {"dormant", "ready", "running", "sleep", "delay", "sema", "event", "suspended", "dead"};
+        std::string out;
+        char line[160];
+        for (const IopThread *thread : m_threadList)
+        {
+            const unsigned state = static_cast<unsigned>(thread->state);
+            std::snprintf(line, sizeof(line), " [t%d %s pc=0x%x ra=0x%x wait=%d prio=%u wake=%d]",
+                          thread->id, state < 9u ? kStateNames[state] : "?", thread->cpu.pc, thread->cpu.gpr[31],
+                          thread->waitId, thread->priority, thread->wakeupCount);
+            out += line;
+        }
+        for (const auto &[id, semaphore] : m_semaphores)
+        {
+            std::snprintf(line, sizeof(line), " [s%d %d/%d]", id, semaphore.current, semaphore.maximum);
+            out += line;
+        }
+        return out;
+    }
+
     void IopKernel::sleepCurrent(IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
@@ -671,20 +725,13 @@ namespace ps2x::iop::detail
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
         IopThread *next = nullptr;
-        for (auto &[id, thread] : m_threads)
+        for (IopThread *thread : m_threadList) // id order, so ties keep the lowest id
         {
-            if (thread.state != IopThreadState::Ready)
-                continue;
-            if (next == nullptr || thread.priority < next->priority ||
-                (thread.priority == next->priority && thread.id < next->id))
-                next = &thread;
+            if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
+                thread->state = IopThreadState::Ready;
+            if (thread->state == IopThreadState::Ready && (next == nullptr || thread->priority < next->priority))
+                next = thread;
         }
         if (next == nullptr)
             return nullptr;
@@ -699,10 +746,10 @@ namespace ps2x::iop::detail
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
     {
         uint64_t nextWake = fallback;
-        for (const auto &[id, thread] : m_threads)
+        for (const IopThread *thread : m_threadList)
         {
-            if (thread.state == IopThreadState::Delay)
-                nextWake = std::min(nextWake, thread.wakeCycle);
+            if (thread->state == IopThreadState::Delay)
+                nextWake = std::min(nextWake, thread->wakeCycle);
         }
         return nextWake;
     }
@@ -719,6 +766,11 @@ namespace ps2x::iop::detail
 
     void IopKernel::cleanupDeadThreads()
     {
+        bool anyDead = false;
+        for (const IopThread *thread : m_threadList)
+            anyDead |= thread->state == IopThreadState::Dead;
+        if (!anyDead)
+            return;
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
             if (thread->second.state != IopThreadState::Dead)
@@ -730,6 +782,7 @@ namespace ps2x::iop::detail
                 (void)m_memory.freeAllocation(thread->second.stackBase);
             thread = m_threads.erase(thread);
         }
+        rebuildThreadList();
     }
 
     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)

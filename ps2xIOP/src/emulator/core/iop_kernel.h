@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -67,6 +69,17 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        [[nodiscard]] bool inThread() const noexcept { return m_currentThread != nullptr; }
+        // WaitEventFlag(id, bits, mode) would return now. False for an unknown flag.
+        [[nodiscard]] bool eventFlagSatisfied(int id, uint32_t bits, uint32_t mode) const;
+        // Code running outside any IOP thread (RPC server functions, module start routines) that must wait for a
+        // semaphore: while set, SignalSema(id) keeps the count for that waiter instead of waking a kernel waiter,
+        // and ends the signalling thread's slice. 0 = none.
+        void setOutsideSemaphoreWait(int id) noexcept { m_outsideSemaphoreWait = id; }
+        // Current count of a semaphore, -1 for an unknown id.
+        [[nodiscard]] int semaphoreCount(int id) const;
+        // One line per thread (id, state, pc, wait id, priority); debug aid.
+        [[nodiscard]] std::string describeThreads() const;
 
     private:
         struct Semaphore
@@ -93,11 +106,16 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
+        // Flat view of m_threads in id order (map nodes are stable); rebuilt when threads are added/removed. The
+        // scheduler scans threads on every IOP time slice, and walking the map there dominated IOP time.
+        std::vector<IopThread *> m_threadList;
+        void rebuildThreadList();
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        int m_outsideSemaphoreWait = 0;
     };
 }

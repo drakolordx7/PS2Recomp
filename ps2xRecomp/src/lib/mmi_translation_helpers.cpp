@@ -236,7 +236,12 @@ namespace ps2recomp
         case PMFHL_LH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
         case PMFHL_SH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
+            // LO/HI are 128-bit on the EE (upper halves in lo1/hi1): halfwords = sat16(LO.w0, LO.w1, HI.w0, HI.w1,
+            // LO.w2, LO.w3, HI.w2, HI.w3).
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_packs_epi32("
+                               "_mm_set_epi64x((int64_t)ctx->hi, (int64_t)ctx->lo), "
+                               "_mm_set_epi64x((int64_t)ctx->hi1, (int64_t)ctx->lo1)));",
+                               inst.rd);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
         }
@@ -454,16 +459,16 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
     {
-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+        // Exchanges halfwords 0<->2 and 4<->6 (EE PEXEH: rd.h0 = rt.h2, rd.h2 = rt.h0, odd halfwords unchanged)
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)), _MM_SHUFFLE(3,0,1,2)));",
                            inst.rd, inst.rt);
     }
 
 
     std::string CodeGenerator::translatePREVH(const Instruction &inst)
     {
-        // Reverses the order of the 8 halfwords
-        return fmt::format("{{ __m128i mask = _mm_setr_epi8(14,15, 12,13, 10,11, 8,9, 6,7, 4,5, 2,3, 0,1); "
+        // Reverses the four halfwords within each doubleword (EE PREVH: rd.h0 = rt.h3 ... rd.h4 = rt.h7 ...)
+        return fmt::format("{{ __m128i mask = _mm_setr_epi8(6,7, 4,5, 2,3, 0,1, 14,15, 12,13, 10,11, 8,9); "
                            "SET_GPR_VEC(ctx, {}, PS2_SHUFFLE_EPI8(GPR_VEC(ctx, {}), mask)); }}",
                            inst.rd, inst.rt);
     }
@@ -471,15 +476,16 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
     {
-        // Parallel multiply halfword, results sum to HI/LO and rd
-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, result); }}",
+        // EE PMULTH: eight signed halfword products p0..p7 (32-bit each). LO = {p0, p1, p4, p5}, HI = {p2, p3, p6, p7}
+        // (128-bit; upper halves in lo1/hi1), rd = {p0, p2, p4, p6}.
+        return fmt::format("{{ alignas(16) int16_t a[8]; alignas(16) int16_t b[8]; int32_t p[8]; \n"
+                           "   _mm_store_si128((__m128i *)a, GPR_VEC(ctx, {})); _mm_store_si128((__m128i *)b, GPR_VEC(ctx, {})); \n"
+                           "   for (int i = 0; i < 8; ++i) p[i] = (int32_t)a[i] * (int32_t)b[i]; \n"
+                           "   ctx->lo = (uint64_t)(uint32_t)p[0] | ((uint64_t)(uint32_t)p[1] << 32); \n"
+                           "   ctx->hi = (uint64_t)(uint32_t)p[2] | ((uint64_t)(uint32_t)p[3] << 32); \n"
+                           "   ctx->lo1 = (uint64_t)(uint32_t)p[4] | ((uint64_t)(uint32_t)p[5] << 32); \n"
+                           "   ctx->hi1 = (uint64_t)(uint32_t)p[6] | ((uint64_t)(uint32_t)p[7] << 32); \n"
+                           "   SET_GPR_VEC(ctx, {}, _mm_set_epi32(p[6], p[4], p[2], p[0])); }}",
                            inst.rs, inst.rt, inst.rd);
     }
 
@@ -513,7 +519,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXEW(const Instruction &inst)
     {
-        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEW(GPR_VEC(ctx, {})));",
+        // EE PEXEW: rd.w0 = rt.w2, rd.w2 = rt.w0, w1/w3 unchanged.
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)));",
                            inst.rd, inst.rt);
     }
 
@@ -560,8 +567,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
     {
-        // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+        // Parallel Exchange Center Halfword: halfwords 1<->2 and 5<->6
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0)));",
                            inst.rd, inst.rt);
     }
 
@@ -577,8 +584,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXCW(const Instruction &inst)
     {
-        // Parallel Exchange Center Word (Swaps words 0<>2, 1<>3)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(1,0,3,2)));",
+        // Parallel Exchange Center Word: words 1<->2
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)));",
                            inst.rd, inst.rt);
     }
 
