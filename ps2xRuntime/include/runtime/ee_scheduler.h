@@ -266,6 +266,8 @@ public:
     static constexpr uint64_t kEeClockHz = 294912000ull;
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
+    // The estimated EE cycle clock (timeline recorder, diagnostics). EE thread only.
+    uint64_t eeCycleForTrace() const noexcept { return m_eeCycle; }
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
 
     explicit EeScheduler(PS2Runtime &runtime);

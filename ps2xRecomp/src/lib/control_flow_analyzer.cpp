@@ -194,7 +194,12 @@ namespace ps2recomp
             {
                 if (jrInst->function == SPECIAL_JALR)
                 {
+                    // An indirect *call*: the target is another function, entered through the runtime dispatcher.
+                    // Only the return address needs a resume label. Treating it like an unresolved local jump made
+                    // every instruction of the caller an entry point (a label and switch case per instruction in
+                    // ~4000 functions), which blocks optimisation across instructions.
                     queueResumeEntryTarget(jrInst->address + 8u);
+                    continue;
                 }
 
                 bool foundTable = false;

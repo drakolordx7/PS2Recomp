@@ -73,14 +73,23 @@ namespace ps2recomp
         return memoryHint;
     }
 
+    // LQ/SQ/LQC2/SQC2 ignore the low four address bits on the EE (the address is forced to a quadword boundary).
+    // Code relies on it: the unaligned-load idiom "lq t0,0(a); lq t1,16(a); mtsab a,0; qfsrv t0,t1,t0" needs both
+    // loads to return the aligned quadwords around a.
+    static std::string alignQuadwordAddress(int width, const std::string &addr)
+    {
+        return width == 128 ? fmt::format("(({}) & ~0xFu)", addr) : addr;
+    }
+
     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,
                                                            const MemoryAccessHint &memoryHint,
                                                            int width,
-                                                           const std::string &addr) const
+                                                           const std::string &rawAddr) const
     {
+        const std::string addr = alignQuadwordAddress(width, rawAddr);
         if (memoryHint.hasAddress)
         {
-            const uint32_t resolvedAddress = memoryHint.address;
+            const uint32_t resolvedAddress = width == 128 ? (memoryHint.address & ~0xFu) : memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {
@@ -99,12 +108,13 @@ namespace ps2recomp
     std::string InstructionTranslator::translateMemoryWrite(const Instruction &inst,
                                                             const MemoryAccessHint &memoryHint,
                                                             int width,
-                                                            const std::string &addr,
+                                                            const std::string &rawAddr,
                                                             const std::string &value) const
     {
+        const std::string addr = alignQuadwordAddress(width, rawAddr);
         if (memoryHint.hasAddress)
         {
-            const uint32_t resolvedAddress = memoryHint.address;
+            const uint32_t resolvedAddress = width == 128 ? (memoryHint.address & ~0xFu) : memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {

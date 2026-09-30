@@ -1,14 +1,21 @@
 #include "iop_memory.h"
 
+#include "ps2x/iop/iop_host_spu2.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        constexpr uint32_t kDmaSpu0Madr = 0x1F8010C0u;
+        constexpr uint32_t kDmaSpu1Madr = 0x1F801500u;
         constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
         constexpr uint32_t kDmaSpu1Chcr = 0x1F801508u;
+        constexpr uint32_t kSpu2RegBase = 0x1F900000u;
+        constexpr uint32_t kSpu2RegEnd = 0x1F900800u;
         constexpr uint32_t kDmaStart = 1u << 24u;
         constexpr int kDmaSpu0Irq = 0x24;
         constexpr int kDmaSpu1Irq = 0x28;
@@ -17,6 +24,22 @@ namespace ps2x::iop::detail
         {
             return (value + alignment - 1u) & ~(alignment - 1u);
         }
+    }
+
+    // Host SPU2 hooks and the interrupt requests queued by iopSpu2RaiseIrq / iopSpu2DmaComplete.
+    IopHostSpu2 g_hostSpu2;
+    std::atomic<uint32_t> g_spu2Pending{0u};
+
+    uint32_t takeSpu2Pending() noexcept
+    {
+        if (g_spu2Pending.load(std::memory_order_relaxed) == 0u)
+            return 0u;
+        return g_spu2Pending.exchange(0u, std::memory_order_acq_rel);
+    }
+
+    bool IopMemory::isSpu2Register(uint32_t phys) noexcept
+    {
+        return phys >= kSpu2RegBase && phys < kSpu2RegEnd && g_hostSpu2.read16 && g_hostSpu2.write16;
     }
 
     IopMemory::IopMemory()
@@ -51,6 +74,8 @@ namespace ps2x::iop::detail
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
+        if (isSpu2Register(phys))
+            return static_cast<uint8_t>(g_hostSpu2.read16(phys & ~1u, spu2Cycle()) >> ((phys & 1u) * 8u));
         const uint32_t value = readHardware32(phys & ~3u);
         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
     }
@@ -64,6 +89,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if ((phys & 1u) == 0u && isSpu2Register(phys))
+            return g_hostSpu2.read16(phys, spu2Cycle());
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -81,6 +108,11 @@ namespace ps2x::iop::detail
             uint32_t value;
             std::memcpy(&value, m_scratch.data() + (phys - ScratchBase), sizeof(value));
             return value;
+        }
+        if ((phys & 3u) == 0u && isSpu2Register(phys))
+        {
+            const uint32_t lo = g_hostSpu2.read16(phys, spu2Cycle());
+            return lo | (static_cast<uint32_t>(g_hostSpu2.read16(phys + 2u, spu2Cycle())) << 16u);
         }
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
             return readHardware32(phys);
@@ -105,6 +137,15 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
+        if (isSpu2Register(phys))
+        {
+            const uint32_t reg = phys & ~1u;
+            const uint32_t shift = (phys & 1u) * 8u;
+            const uint32_t current = g_hostSpu2.read16(reg, spu2Cycle());
+            const uint32_t merged = (current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
+            g_hostSpu2.write16(reg, static_cast<uint16_t>(merged), spu2Cycle());
+            return;
+        }
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
@@ -119,6 +160,11 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if ((phys & 1u) == 0u && isSpu2Register(phys))
+        {
+            g_hostSpu2.write16(phys, value, spu2Cycle());
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -137,6 +183,12 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
+            return;
+        }
+        if ((phys & 3u) == 0u && isSpu2Register(phys))
+        {
+            g_hostSpu2.write16(phys, static_cast<uint16_t>(value), spu2Cycle());
+            g_hostSpu2.write16(phys + 2u, static_cast<uint16_t>(value >> 16u), spu2Cycle());
             return;
         }
         if ((phys & 3u) == 0u)
@@ -213,6 +265,12 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if ((address == kDmaSpu0Madr || address == kDmaSpu1Madr) && g_hostSpu2.dmaStart && g_hostSpu2.dmaMadr)
+        {
+            const auto chcr = m_hardware.find(address + 8u);
+            if (chcr != m_hardware.end() && (chcr->second & kDmaStart) != 0u)
+                return g_hostSpu2.dmaMadr(address == kDmaSpu1Madr ? 1 : 0);
+        }
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -249,6 +307,11 @@ namespace ps2x::iop::detail
         m_hardware[address] = value;
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
+        if (g_hostSpu2.dmaStart)
+        {
+            startSpu2Dma(address, value); // CHCR.TR stays set until the host completes the transfer
+            return;
+        }
 
         const bool secondCore = address == kDmaSpu1Chcr;
         m_hardware[address] = value & ~kDmaStart;
@@ -273,6 +336,38 @@ namespace ps2x::iop::detail
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             std::max<uint64_t>(transferWords * 2u, 64u),
         };
+    }
+
+    void IopMemory::startSpu2Dma(uint32_t chcrAddress, uint32_t chcr)
+    {
+        const int core = chcrAddress == kDmaSpu1Chcr ? 1 : 0;
+        const uint32_t base = chcrAddress - 8u;
+        const auto madrIt = m_hardware.find(base);
+        const auto bcrIt = m_hardware.find(base + 4u);
+        const uint32_t madr = (madrIt != m_hardware.end() ? madrIt->second : 0u) & 0x00FFFFFFu;
+        const uint32_t bcr = bcrIt != m_hardware.end() ? bcrIt->second : 0u;
+        // As PCSX2's psxDmaGeneric: words = block count * block size
+        const uint64_t words = static_cast<uint64_t>(bcr >> 16u) * (bcr & 0xFFFFu);
+        const uint32_t phys = madr & (RamSize - 1u) & ~1u;
+        const uint64_t bytes = std::min<uint64_t>(words * 4u, RamSize - phys);
+        m_spu2DmaEnd[core] = madr + static_cast<uint32_t>(words * 4u);
+        g_hostSpu2.dmaStart(core,
+                            reinterpret_cast<uint16_t *>(m_ram.data() + phys),
+                            madr,
+                            static_cast<uint32_t>(bytes / 2u),
+                            (chcr & 1u) != 0u,
+                            spu2Cycle());
+    }
+
+    bool IopMemory::completeSpu2Dma(int core)
+    {
+        const uint32_t chcrAddress = core ? kDmaSpu1Chcr : kDmaSpu0Chcr;
+        const auto chcr = m_hardware.find(chcrAddress);
+        if (chcr == m_hardware.end() || (chcr->second & kDmaStart) == 0u)
+            return false; // stopped by the guest (CHCR.TR cleared) before the SPU2 finished
+        chcr->second &= ~kDmaStart;
+        m_hardware[chcrAddress - 8u] = g_hostSpu2.dmaMadr ? g_hostSpu2.dmaMadr(core) : m_spu2DmaEnd[core];
+        return true;
     }
 
     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
@@ -367,5 +462,28 @@ namespace ps2x::iop::detail
             result.push_back(ch);
         }
         return result;
+    }
+}
+
+namespace ps2x::iop
+{
+    void iopSetHostSpu2(const IopHostSpu2 &hooks)
+    {
+        detail::g_hostSpu2 = hooks;
+    }
+
+    const IopHostSpu2 &iopHostSpu2()
+    {
+        return detail::g_hostSpu2;
+    }
+
+    void iopSpu2RaiseIrq()
+    {
+        detail::g_spu2Pending.fetch_or(1u, std::memory_order_acq_rel);
+    }
+
+    void iopSpu2DmaComplete(int core)
+    {
+        detail::g_spu2Pending.fetch_or(core ? 4u : 2u, std::memory_order_acq_rel);
     }
 }

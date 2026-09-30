@@ -131,11 +131,18 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        const bool locals = m_gen.m_localsMode;
+        const std::string rawCode = delaySlotCode();
+        // Locals mode only publishes the delay slot state when the slot can call into the runtime.
+        const bool publishState = !locals || CodeGenerator::codeNeedsPc(rawCode);
+        if (publishState)
+        {
+            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
 
-        const std::string code = delaySlotCode();
+        const std::string code = locals ? m_gen.wrapSync(rawCode) : rawCode;
         std::istringstream lines(code);
         std::string line;
         while (std::getline(lines, line))
@@ -146,7 +153,10 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (publishState)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -174,6 +184,25 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent)
     {
+        if (m_gen.m_localsMode)
+        {
+            // ctx->pc is only maintained where somebody reads it: a jump to a delay slot address relies on it (see
+            // emitResumeFromDelaySlotEntry), and a yield must publish the resume address.
+            if (m_gen.m_curDelaySlotAddrs.contains(target))
+            {
+                m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
+            }
+            if (target <= sourcePc && !isCallLikeEdge())
+            {
+                m_ss << fmt::format("{}if (PS2_BACKEDGE_DUE()) [[unlikely]] {{\n", indent);
+                m_ss << fmt::format("{}    ctx->pc = 0x{:X}u;\n", indent, target);
+                m_ss << fmt::format("{}    PS2_FLUSH();\n", indent);
+                m_ss << fmt::format("{}    if (ps2CgBudgetSlow(runtime)) {{ return; }}\n", indent);
+                m_ss << fmt::format("{}}}\n", indent);
+            }
+            m_ss << fmt::format("{}goto label_{:x};\n", indent, target);
+            return;
+        }
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
         if (target <= sourcePc && !isCallLikeEdge())
         {
@@ -220,6 +249,10 @@ namespace ps2recomp
             return false;
         }
 
+        if (m_gen.m_localsMode)
+        {
+            m_ss << indent << "PS2_FLUSH();\n";
+        }
         m_ss << indent << functionName << "(rdram, ctx, runtime); return;\n";
         return true;
     }
@@ -227,6 +260,22 @@ namespace ps2recomp
     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
     {
         const bool isCall = kind == StaticBranchKind::Call;
+        if (m_gen.m_localsMode)
+        {
+            m_ss << indent << "PS2_FLUSH();\n";
+            if (isCall)
+            {
+                m_ss << fmt::format("{}if (!{}(rdram, ctx, runtime, 0x{:X}u, 0x{:X}u, 0x{:X}u, false)) {{ return; }}\n",
+                                    indent, m_gen.m_dspMode ? "ps2DspCall" : "ps2CgCall", target, branchPc(), fallthroughPc());
+                m_ss << indent << "PS2_RELOAD();\n";
+                return;
+            }
+            if (m_gen.m_dspMode)
+            {
+                m_ss << fmt::format("{}ps2DspTail(ctx, 0x{:X}u); return;\n", indent, target);
+                return;
+            }
+        }
         emitRuntimeBranchDispatch(fmt::format("0x{:X}u", target),
                                   branchPc(),
                                   isCall ? fallthroughPc() : 0u,
@@ -238,6 +287,15 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitExternalRegisterCallDispatch(std::string_view jumpTargetExpression, std::string_view indent)
     {
+        if (m_gen.m_localsMode)
+        {
+            m_ss << indent << "PS2_FLUSH();\n";
+            m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
+            m_ss << fmt::format("{}if (!{}(rdram, ctx, runtime, {}, 0x{:X}u, 0x{:X}u, true)) {{ return; }}\n",
+                                indent, m_gen.m_dspMode ? "ps2DspCall" : "ps2CgCall", jumpTargetExpression, branchPc(), fallthroughPc());
+            m_ss << indent << "PS2_RELOAD();\n";
+            return;
+        }
         emitRuntimeBranchDispatch(jumpTargetExpression,
                                   branchPc(),
                                   fallthroughPc(),
@@ -254,6 +312,12 @@ namespace ps2recomp
     {
         const bool isReturn = kind == RegisterBranchKind::Jump && rsReg == 31u;
 
+        if (m_gen.m_localsMode)
+        {
+            m_ss << indent << "PS2_FLUSH();\n";
+            m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
+        }
+
         if (isReturn)
         {
             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
@@ -265,6 +329,13 @@ namespace ps2recomp
             m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
             m_ss << indent << "return;\n";
             m_ss << indent << "#endif\n";
+            return;
+        }
+
+        if (m_gen.m_dspMode)
+        {
+            m_ss << fmt::format("{}ps2DspTailIndirect(rdram, ctx, runtime, {}, 0x{:X}u); return;\n", indent,
+                                jumpTargetExpression, branchPc());
             return;
         }
 
@@ -295,6 +366,10 @@ namespace ps2recomp
         const bool isSyscall = !resolvedSyscallName.empty();
         const std::string_view handlerName = isSyscall ? resolvedSyscallName : resolvedStubName;
 
+        if (m_gen.m_localsMode)
+        {
+            m_ss << indent << "PS2_FLUSH();\n";
+        }
         m_ss << indent << "{\n";
         if (kind == StaticBranchKind::Call)
         {
@@ -315,6 +390,10 @@ namespace ps2recomp
         else
         {
             m_ss << fmt::format("{}if (ctx->pc != 0x{:X}u) {{ return; }}\n", indent, fallthroughPc());
+            if (m_gen.m_localsMode)
+            {
+                m_ss << indent << "PS2_RELOAD();\n";
+            }
         }
 
         return true;
@@ -366,14 +445,36 @@ namespace ps2recomp
         }
 
         emitDelaySlot("        ");
-        m_ss << "        ctx->pc = jumpTarget;\n";
+        if (!m_gen.m_localsMode)
+        {
+            m_ss << "        ctx->pc = jumpTarget;\n";
+        }
 
         if (!sortedInternalTargets.empty())
         {
             m_ss << "        switch (jumpTarget) {\n";
             for (uint32_t target : sortedInternalTargets)
             {
+                if (m_gen.m_localsMode && m_gen.m_curDelaySlotAddrs.contains(target))
+                {
+                    m_ss << fmt::format("            case 0x{:X}u: ctx->pc = 0x{:X}u; goto label_{:x};\n", target, target, target);
+                    continue;
+                }
                 m_ss << fmt::format("            case 0x{:X}u: goto label_{:x};\n", target, target);
+            }
+            m_ss << "            default: break;\n";
+            m_ss << "        }\n";
+        }
+
+        if (m_gen.m_dspMode && kind == RegisterBranchKind::Jump && rsReg == 31u && !m_gen.m_curSelfReturns.empty())
+        {
+            m_ss << "        switch (jumpTarget) {\n";
+            for (uint32_t target : m_gen.m_curSelfReturns)
+            {
+                m_ss << fmt::format("            case 0x{:X}u:\n", target);
+                m_ss << "                ++g_ps2DspStat[1];\n";
+                m_ss << fmt::format("                if ((g_ps2EeBudget -= 8) < 0) [[unlikely]] {{ ctx->pc = 0x{:X}u; PS2_FLUSH(); if (ps2CgBudgetSlow(runtime)) {{ return; }} }}\n", target);
+                m_ss << fmt::format("                goto label_{:x};\n", target);
             }
             m_ss << "            default: break;\n";
             m_ss << "        }\n";
@@ -501,7 +602,18 @@ namespace ps2recomp
             }
             else
             {
-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                if (m_gen.m_localsMode)
+                {
+                    m_ss << "            PS2_FLUSH();\n";
+                }
+                if (m_gen.m_dspMode)
+                {
+                    m_ss << fmt::format("            ps2DspTail(ctx, 0x{:X}u);\n", target);
+                }
+                else
+                {
+                    m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                }
                 m_ss << "            return;\n";
             }
             m_ss << "        }\n";
@@ -522,7 +634,18 @@ namespace ps2recomp
             }
             else
             {
-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                if (m_gen.m_localsMode)
+                {
+                    m_ss << "            PS2_FLUSH();\n";
+                }
+                if (m_gen.m_dspMode)
+                {
+                    m_ss << fmt::format("            ps2DspTail(ctx, 0x{:X}u);\n", target);
+                }
+                else
+                {
+                    m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                }
                 m_ss << "            return;\n";
             }
             m_ss << "        }\n";
@@ -533,7 +656,18 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitFallbackInstruction()
     {
-        m_ss << "    " << m_gen.translateInstruction(m_branchInst) << "\n";
+        {
+            std::string code = m_gen.translateInstruction(m_branchInst);
+            if (m_gen.m_localsMode)
+            {
+                if (CodeGenerator::codeNeedsPc(code))
+                {
+                    m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+                }
+                code = m_gen.wrapSync(code);
+            }
+            m_ss << "    " << code << "\n";
+        }
         emitDelaySlot("    ");
     }
 
@@ -547,6 +681,10 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitFinalFallthrough()
     {
+        if (m_gen.m_localsMode)
+        {
+            return; // FunctionEmitter publishes the pc where the function ends
+        }
         m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", fallthroughPc());
     }
 
@@ -554,7 +692,10 @@ namespace ps2recomp
     {
         (void)m_function;
         emitResumeFromDelaySlotEntry();
-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+        if (!m_gen.m_localsMode)
+        {
+            m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+        }
 
         if (m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL)
         {

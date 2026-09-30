@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -46,5 +47,13 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<uint32_t, ExportLibrary> m_libraries;
+        // decode() runs on every IOP instruction and walks back up to 64 KB to find a stub's import table; remember
+        // resolved stubs (keyed by physical pc, validated by the stub's two instruction words). Cleared on reset/unload.
+        struct CachedImport
+        {
+            uint32_t delayWord;
+            IopImportCall call;
+        };
+        mutable std::unordered_map<uint32_t, CachedImport> m_decodeCache;
     };
 }

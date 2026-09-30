@@ -141,10 +141,53 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
+// ---- PS2 float semantics (EE FPU and VU) --------------------------------------------------------------------------
+// The PS2 has no Inf/NaN: values with exponent 255 behave as huge normals, overflow saturates to +-max and division by
+// zero gives +-max (sign of numerator xor denominator). Denormals are flushed to zero (the host game thread runs with
+// FTZ/DAZ). Emulating this matters: games rely on it, e.g. x/0 in a normalisation must not poison later maths with NaN.
+inline float ps2_fclamp(float x)
+{
+    uint32_t b;
+    std::memcpy(&b, &x, 4);
+    if ((b & 0x7F800000u) == 0x7F800000u)
+        b = (b & 0x80000000u) | 0x7F7FFFFFu;
+    std::memcpy(&x, &b, 4);
+    return x;
+}
+inline float ps2_fmax_signed(float a, float b)
+{
+    uint32_t ua, ub;
+    std::memcpy(&ua, &a, 4);
+    std::memcpy(&ub, &b, 4);
+    const uint32_t r = ((ua ^ ub) & 0x80000000u) | 0x7F7FFFFFu;
+    float f;
+    std::memcpy(&f, &r, 4);
+    return f;
+}
+inline float ps2_fdiv(float a, float b)
+{
+    a = ps2_fclamp(a);
+    b = ps2_fclamp(b);
+    return (b == 0.0f) ? ps2_fmax_signed(a, b) : ps2_fclamp(a / b);
+}
+inline float ps2_frsqrt(float a, float b)
+{
+    a = ps2_fclamp(a);
+    b = ps2_fclamp(b);
+    return (b == 0.0f) ? ps2_fmax_signed(a, b) : ps2_fclamp(a / std::sqrt(std::fabs(b)));
+}
+inline __m128 ps2_vclamp(__m128 v)
+{
+    // min(NaN, max) yields max, so NaN and +Inf become +max and -Inf becomes -max.
+    return _mm_max_ps(_mm_min_ps(v, _mm_set1_ps(3.40282347e+38f)), _mm_set1_ps(-3.40282347e+38f));
+}
+#define PS2_VADD(a, b) ps2_vclamp(_mm_add_ps(ps2_vclamp((__m128)(a)), ps2_vclamp((__m128)(b))))
+#define PS2_VSUB(a, b) ps2_vclamp(_mm_sub_ps(ps2_vclamp((__m128)(a)), ps2_vclamp((__m128)(b))))
+#define PS2_VMUL(a, b) ps2_vclamp(_mm_mul_ps(ps2_vclamp((__m128)(a)), ps2_vclamp((__m128)(b))))
+#define PS2_VDIV(a, b) ps2_vclamp(_mm_div_ps((__m128)(a), (__m128)(b)))
+#define PS2_VU_DIV(fs, ft) ps2_fdiv((fs), (ft))
+#define PS2_VU_SQRT(ft) std::sqrt(std::fabs(ps2_fclamp(ft)))
+#define PS2_VU_RSQRT(fs, ft) ps2_frsqrt((fs), (ft))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
@@ -605,11 +648,12 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+#define FPU_ADD_S(a, b) ps2_fclamp(ps2_fclamp((float)(a)) + ps2_fclamp((float)(b)))
+#define FPU_SUB_S(a, b) ps2_fclamp(ps2_fclamp((float)(a)) - ps2_fclamp((float)(b)))
+#define FPU_MUL_S(a, b) ps2_fclamp(ps2_fclamp((float)(a)) * ps2_fclamp((float)(b)))
+#define FPU_DIV_S(a, b) ps2_fdiv((float)(a), (float)(b))
+#define FPU_RSQRT_S(a, b) ps2_frsqrt((float)(a), (float)(b))
+#define FPU_SQRT_S(a) std::sqrt(std::fabs(ps2_fclamp((float)(a))))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -623,7 +667,16 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// EE CVT.W.S truncates toward zero and saturates (PCSX2: exponent above 2^30 -> INT_MAX / INT_MIN).
+inline int32_t ps2_cvt_w_s(float f)
+{
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    if ((b & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(f);
+    return (b & 0x80000000u) ? static_cast<int32_t>(0x80000000u) : 0x7FFFFFFF;
+}
+#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

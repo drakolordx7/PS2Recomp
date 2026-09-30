@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
@@ -71,6 +72,25 @@ namespace ps2recomp
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
+
+        // Register-locals code generation (runtime side: ps2_cg.h). PS2X_CODEGEN=locals enables it for every
+        // function; PS2X_CODEGEN_FUNCS=<file> (one hex start address per line) restricts it to those functions.
+        bool m_localsEnabled = false;
+        bool m_localsRestricted = false;
+        std::unordered_set<uint32_t> m_localsFunctions;
+        bool m_localsMode = false; // the function being emitted uses locals
+        // Guest control flow without the scheduler (runtime side: ps2_cg_dsp.h, patch 0023). PS2X_CODEGEN_DSP=1 on top of
+        // PS2X_CODEGEN=locals: tail jumps leave through the caller's trampoline instead of unwinding to the scheduler, and
+        // `jr $ra` back into a self-recursive function's own return labels stays local.
+        bool m_dspEnabled = false;
+        bool m_dspMode = false; // the function being emitted uses it (locals mode and enabled)
+        std::set<uint32_t> m_curSelfReturns; // return labels of the current function's own recursive `jal`s
+        std::unordered_set<uint32_t> m_curDelaySlotAddrs; // delay slot addresses of the current function
+        bool usesLocals(uint32_t functionStart) const;
+        // Text classification for locals mode: does the emitted statement need ctx->pc / a full GPR sync?
+        static bool codeNeedsPc(const std::string &code);
+        static bool codeNeedsSync(const std::string &code);
+        std::string wrapSync(const std::string &code) const;
 
         std::string translateInstruction(const Instruction &inst);
         std::string translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint);

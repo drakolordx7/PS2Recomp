@@ -2002,6 +2002,38 @@ namespace ps2recomp
             return best;
         };
 
+        // Ghidra exports standalone code blocks (static initializers, thunks, ...) as entry_* labels. Only entry_*
+        // blocks nested inside a real function are synthetic wrappers; standalone ones need their own resume
+        // points, otherwise a thread switched out inside a call from them cannot be resumed.
+        std::vector<std::pair<uint32_t, uint32_t>> ownerRanges;
+        for (const auto &function : m_functions)
+        {
+            if (function.isRecompiled && !function.isStub && !function.isSkipped &&
+                !isEntryFunctionName(function.name) && function.end > function.start)
+            {
+                ownerRanges.emplace_back(function.start, function.end);
+            }
+        }
+        std::sort(ownerRanges.begin(), ownerRanges.end());
+        uint32_t maxEnd = 0u;
+        std::vector<uint32_t> prefixMaxEnd;
+        prefixMaxEnd.reserve(ownerRanges.size());
+        for (const auto &range : ownerRanges)
+        {
+            maxEnd = std::max(maxEnd, range.second);
+            prefixMaxEnd.push_back(maxEnd);
+        }
+        auto nestedInRealFunction = [&](uint32_t address) -> bool
+        {
+            auto it = std::upper_bound(ownerRanges.begin(), ownerRanges.end(), std::make_pair(address, UINT32_MAX));
+            if (it == ownerRanges.begin())
+            {
+                return false;
+            }
+            const size_t idx = static_cast<size_t>(std::distance(ownerRanges.begin(), it)) - 1u;
+            return prefixMaxEnd[idx] > address;
+        };
+
         for (const auto &function : m_functions)
         {
             if (!function.isRecompiled || function.isStub || function.isSkipped)
@@ -2009,7 +2041,7 @@ namespace ps2recomp
                 continue;
             }
 
-            if (isEntryFunctionName(function.name))
+            if (isEntryFunctionName(function.name) && nestedInRealFunction(function.start))
             {
                 continue;
             }
@@ -2066,6 +2098,16 @@ namespace ps2recomp
             ++it;
         }
 
+        foldEntryFragments();
+        totalTargets = 0u;
+        for (auto &[owner, targets] : m_resumeEntryTargetsByOwner)
+        {
+            (void)owner;
+            std::sort(targets.begin(), targets.end());
+            targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            totalTargets += targets.size();
+        }
+
         m_codeGenerator->setResumeEntryTargets(m_resumeEntryTargetsByOwner);
 
         if (totalTargets > 0u)
@@ -2078,6 +2120,181 @@ namespace ps2recomp
                 << " owner function(s)";
             m_reporter.progress(msg.str());
         }
+    }
+
+    // Ghidra's export splits code into many tiny `entry_*` blocks: 56 k of them lie inside a real function (a copy of the
+    // tail of that function from an inner label onwards), another 7 k form contiguous chains that are really one function.
+    // Every block is a separate C++ function, every jump between blocks returns to the scheduler (registers written back
+    // and reloaded, one guest dispatch), and the function table sends a resume at an inner label to the block instead of
+    // to the function that owns the code, so after one yield a loop keeps running block to block through the scheduler
+    // (the game's flag-wait loop was ~2 M dispatches per second). PS2X_CODEGEN_FOLD=1 removes the blocks as functions:
+    //  - a block nested in a real function (its start is a decoded instruction of it, its end within it) becomes a
+    //    resume label of that function; the table maps the block's start to the function (resume switch);
+    //  - contiguous standalone blocks are merged into one function under the first block's name (the others become
+    //    resume labels of it), up to kMaxFoldedInstructions instructions.
+    // The generated code for every removed block address is reachable through the owner's `switch (ctx->pc)`.
+    void PS2Recompiler::foldEntryFragments()
+    {
+        const char *env = std::getenv("PS2X_CODEGEN_FOLD");
+        if (!env || env[0] == '\0' || env[0] == '0')
+        {
+            return;
+        }
+        constexpr size_t kMaxFoldedInstructions = 4096u;
+
+        auto isCode = [](const Function &f)
+        { return f.isRecompiled && !f.isStub && !f.isSkipped && f.end > f.start; };
+        auto decodedHas = [](const std::vector<Instruction> &d, uint32_t address)
+        {
+            auto it = std::lower_bound(d.begin(), d.end(), address,
+                                       [](const Instruction &i, uint32_t a)
+                                       { return i.address < a; });
+            return it != d.end() && it->address == address;
+        };
+        auto isPinned = [&](const Function &f)
+        {
+            return (m_bootstrapInfo.valid && f.start == m_bootstrapInfo.entry) ||
+                   m_correctnessCriticalFunctionStarts.contains(f.start) ||
+                   m_stubFunctionStarts.contains(f.start) || m_skipFunctionStarts.contains(f.start);
+        };
+
+        std::vector<size_t> real;
+        for (size_t i = 0; i < m_functions.size(); ++i)
+        {
+            if (isCode(m_functions[i]) && !isEntryFunctionName(m_functions[i].name))
+            {
+                real.push_back(i);
+            }
+        }
+        std::sort(real.begin(), real.end(), [&](size_t a, size_t b)
+                  { return m_functions[a].start < m_functions[b].start; });
+
+        std::vector<char> folded(m_functions.size(), 0);
+        size_t nested = 0u, chained = 0u;
+
+        // 1. entry_* blocks inside a real function.
+        for (size_t i = 0; i < m_functions.size(); ++i)
+        {
+            const Function &s = m_functions[i];
+            if (!isCode(s) || !isEntryFunctionName(s.name) || isPinned(s))
+            {
+                continue;
+            }
+            auto it = std::upper_bound(real.begin(), real.end(), s.start,
+                                       [&](uint32_t a, size_t idx)
+                                       { return a < m_functions[idx].start; });
+            const Function *owner = nullptr;
+            for (int steps = 0; it != real.begin() && steps < 64; ++steps)
+            {
+                --it;
+                const Function &f = m_functions[*it];
+                if (f.start >= s.start || f.end <= s.start)
+                {
+                    continue;
+                }
+                if (s.end > f.end)
+                {
+                    continue;
+                }
+                auto dIt = m_decodedFunctions.find(f.start);
+                if (dIt == m_decodedFunctions.end() || !decodedHas(dIt->second, s.start))
+                {
+                    continue;
+                }
+                owner = &f;
+                break;
+            }
+            if (!owner)
+            {
+                continue;
+            }
+            {
+                // Configured entry points (code pointers) inside the block were registered under the block: hand them over.
+                std::vector<uint32_t> inherited;
+                auto own = m_resumeEntryTargetsByOwner.find(s.start);
+                if (own != m_resumeEntryTargetsByOwner.end())
+                {
+                    inherited = std::move(own->second);
+                    m_resumeEntryTargetsByOwner.erase(own);
+                }
+                auto &dst = m_resumeEntryTargetsByOwner[owner->start];
+                dst.push_back(s.start);
+                dst.insert(dst.end(), inherited.begin(), inherited.end());
+            }
+            folded[i] = 1;
+            ++nested;
+        }
+
+        // 2. contiguous standalone entry_* blocks.
+        std::vector<size_t> standalone;
+        for (size_t i = 0; i < m_functions.size(); ++i)
+        {
+            if (!folded[i] && isCode(m_functions[i]) && isEntryFunctionName(m_functions[i].name) &&
+                m_decodedFunctions.contains(m_functions[i].start))
+            {
+                standalone.push_back(i);
+            }
+        }
+        std::sort(standalone.begin(), standalone.end(), [&](size_t a, size_t b)
+                  { return m_functions[a].start < m_functions[b].start; });
+        for (size_t k = 0; k < standalone.size();)
+        {
+            const size_t head = standalone[k];
+            Function &h = m_functions[head];
+            std::vector<Instruction> merged = m_decodedFunctions[h.start];
+            size_t next = k + 1u;
+            while (next < standalone.size() && !isPinned(m_functions[standalone[next]]))
+            {
+                const size_t fi = standalone[next];
+                const Function &f = m_functions[fi];
+                if (f.start != h.end)
+                {
+                    break;
+                }
+                const std::vector<Instruction> &d = m_decodedFunctions[f.start];
+                if (d.empty() || merged.size() + d.size() > kMaxFoldedInstructions)
+                {
+                    break;
+                }
+                merged.insert(merged.end(), d.begin(), d.end());
+                m_resumeEntryTargetsByOwner[h.start].push_back(f.start);
+                auto own = m_resumeEntryTargetsByOwner.find(f.start);
+                if (own != m_resumeEntryTargetsByOwner.end())
+                {
+                    auto &dst = m_resumeEntryTargetsByOwner[h.start];
+                    dst.insert(dst.end(), own->second.begin(), own->second.end());
+                    m_resumeEntryTargetsByOwner.erase(f.start);
+                }
+                h.end = f.end;
+                folded[fi] = 1;
+                ++chained;
+                ++next;
+            }
+            if (next > k + 1u)
+            {
+                m_decodedFunctions[h.start] = std::move(merged);
+            }
+            k = next;
+        }
+
+        std::vector<Function> kept;
+        kept.reserve(m_functions.size());
+        for (size_t i = 0; i < m_functions.size(); ++i)
+        {
+            if (folded[i])
+            {
+                m_decodedFunctions.erase(m_functions[i].start);
+                m_resumeEntryTargetsByOwner.erase(m_functions[i].start);
+                continue;
+            }
+            kept.push_back(std::move(m_functions[i]));
+        }
+        m_functions = std::move(kept);
+
+        std::ostringstream msg;
+        msg << "folded " << nested << " entry_* blocks nested in real functions and " << chained
+            << " standalone entry_* blocks into contiguous chains; " << m_functions.size() << " functions remain";
+        m_reporter.progress(msg.str());
     }
 
     bool PS2Recompiler::decodeFunction(Function &function)

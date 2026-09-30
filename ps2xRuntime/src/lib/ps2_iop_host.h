@@ -2,10 +2,13 @@
 
 #include "ps2x/iop/iop_host.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 class PS2Runtime;
 struct R5900Context;
@@ -86,12 +89,32 @@ public:
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
+    // Threaded IOP mode: sendSifCommand queues instead of touching the EE scheduler; drainPosted() (EE thread) applies
+    // the queue in order. See ps2_iop_post.h.
+    void setPostSifCommands(bool enable);
+    void drainPosted();
+    // IOP thread: queue `work` to run on the EE thread, in order with the posted SIF commands.
+    void postWork(std::function<void()> work);
+    [[nodiscard]] uint64_t postedCount() const { return m_postedTotal.load(std::memory_order_relaxed); }
+
 private:
     friend class CallScope;
 
     bool guestRange(uint32_t address, size_t size, uint8_t *&begin) const;
 
+    struct PostedSifCommand
+    {
+        uint32_t commandId = 0;
+        std::vector<uint8_t> packet;
+        std::function<void()> work; // set: run this instead of dispatching a SIF command
+    };
+
     PS2Runtime &m_runtime;
+    std::atomic<bool> m_postSifCommands{false};
+    std::mutex m_postMutex;
+    std::vector<PostedSifCommand> m_posted;
+    bool m_postWakeQueued = false;
+    std::atomic<uint64_t> m_postedTotal{0};
     std::recursive_mutex m_callMutex;
     R5900Context *m_activeContext = nullptr;
     uint8_t *m_activeRdram = nullptr;

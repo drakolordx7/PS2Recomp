@@ -19,6 +19,8 @@
 #include "ps2_runtime_calls.h"
 
 #include <fmt/format.h>
+#include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cstring>
@@ -103,6 +105,56 @@ namespace ps2recomp
         {
             m_symbols.emplace(symbol.address, symbol);
         }
+
+        if (const char *mode = std::getenv("PS2X_CODEGEN"))
+        {
+            m_localsEnabled = std::string(mode) == "locals";
+        }
+        if (const char *dsp = std::getenv("PS2X_CODEGEN_DSP"))
+        {
+            m_dspEnabled = dsp[0] != '\0' && dsp[0] != '0';
+        }
+        if (const char *funcs = std::getenv("PS2X_CODEGEN_FUNCS"))
+        {
+            std::ifstream in(funcs);
+            std::string line;
+            while (std::getline(in, line))
+            {
+                if (line.empty() || line[0] == '#')
+                    continue;
+                m_localsFunctions.insert(static_cast<uint32_t>(std::strtoul(line.c_str(), nullptr, 16)));
+            }
+            m_localsRestricted = true;
+        }
+    }
+
+    bool CodeGenerator::usesLocals(uint32_t functionStart) const
+    {
+        if (!m_localsEnabled)
+            return false;
+        return !m_localsRestricted || m_localsFunctions.contains(functionStart);
+    }
+
+    bool CodeGenerator::codeNeedsPc(const std::string &code)
+    {
+        return code.find("runtime->") != std::string::npos ||
+               code.find("ps2_syscalls::") != std::string::npos ||
+               code.find("ps2_stubs::") != std::string::npos;
+    }
+
+    bool CodeGenerator::codeNeedsSync(const std::string &code)
+    {
+        return code.find("ps2_syscalls::") != std::string::npos ||
+               code.find("ps2_stubs::") != std::string::npos ||
+               code.find("handleSyscall") != std::string::npos ||
+               code.find("handleBreak") != std::string::npos;
+    }
+
+    std::string CodeGenerator::wrapSync(const std::string &code) const
+    {
+        if (!m_localsMode || !codeNeedsSync(code))
+            return code;
+        return "PS2_FLUSH();\n" + code + "\nPS2_RELOAD();";
     }
 
     void CodeGenerator::setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames)

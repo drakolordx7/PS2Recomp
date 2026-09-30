@@ -1,6 +1,9 @@
 #include "ps2_iop_host.h"
+#include "ps2_iop_post.h"
+#include "ps2_iop_async.h"
 
 #include "ps2_runtime.h"
+#include "ps2x/iop/iop_subsystem.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
@@ -8,6 +11,8 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -17,6 +22,64 @@
 #if !defined(_WIN32)
 #include <sys/types.h>
 #endif
+
+namespace
+{
+    // The adapter whose posted-work queue EeScheduler drains (ps2_iop_post.h). One runtime per process.
+    std::atomic<PS2IopHostAdapter *> g_postAdapter{nullptr};
+    std::atomic<ps2x::iop::IopSubsystem *> g_asyncSubsystem{nullptr};
+}
+
+void ps2IopRpcInstall(ps2x::iop::IopSubsystem *subsystem)
+{
+    g_asyncSubsystem.store(subsystem, std::memory_order_release);
+}
+
+bool ps2IopRpcSubmit(const ps2x::iop::RpcRequest &request, std::function<void(const ps2x::iop::RpcResult &)> eeDone)
+{
+    ps2x::iop::IopSubsystem *const subsystem = g_asyncSubsystem.load(std::memory_order_acquire);
+    PS2IopHostAdapter *const adapter = g_postAdapter.load(std::memory_order_acquire);
+    if (!subsystem || !adapter || !eeDone)
+        return false;
+    if (!subsystem->canOffloadRpc(request.sid))
+        return false;
+    ps2x::iop::IopSubsystem::AsyncRpc call;
+    call.request = request;
+    call.send.resize(request.send.size);
+    if (request.send.size != 0u && !adapter->readGuest(request.send.address, call.send.data(), call.send.size()))
+        return false;
+    call.done = [adapter, eeDone = std::move(eeDone)](ps2x::iop::RpcResult result)
+    {
+        adapter->postWork([eeDone, result]() { eeDone(result); });
+    };
+    return subsystem->submitRpc(std::move(call));
+}
+
+void PS2IopHostAdapter::postWork(std::function<void()> work)
+{
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(m_postMutex);
+        PostedSifCommand posted;
+        posted.work = std::move(work);
+        m_posted.push_back(std::move(posted));
+        if (!m_postWakeQueued)
+        {
+            m_postWakeQueued = true;
+            wake = true;
+        }
+    }
+    m_postedTotal.fetch_add(1, std::memory_order_relaxed);
+    if (wake)
+        m_runtime.postEeEvent(EeEvent{EeEventType::Dmac, kIopPostedWorkEventId, 0u});
+}
+
+void PS2IopHostAdapter::setPostSifCommands(bool enable)
+{
+    m_postSifCommands.store(enable, std::memory_order_release);
+    if (enable)
+        g_postAdapter.store(this, std::memory_order_release);
+}
 
 PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
     : m_lock(owner.m_callMutex),
@@ -83,6 +146,8 @@ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
 
 PS2IopHostAdapter::~PS2IopHostAdapter()
 {
+    PS2IopHostAdapter *self = this;
+    g_postAdapter.compare_exchange_strong(self, nullptr);
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     for (auto &[handle, file] : m_hostFiles)
     {
@@ -103,7 +168,8 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
 bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
 {
     begin = nullptr;
-    uint8_t *const rdram = m_activeRdram
+    // The IOP thread never runs inside an EE call scope (m_activeRdram belongs to the EE thread).
+    uint8_t *const rdram = (m_activeRdram && !ps2x::iop::onIopThread())
                                ? m_activeRdram
                                : m_runtime.memory().getRDRAM();
     if (!rdram)
@@ -507,6 +573,31 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                        const void *packet,
                                        size_t packetSize)
 {
+    if (m_postSifCommands.load(std::memory_order_acquire))
+    {
+        // Threaded IOP: queue the packet (in order) for the EE thread; dispatchSifCommand allocates guest memory and
+        // queues an EE invocation, which only the EE thread may do. Returns true like a delivered command (the IOP
+        // ignores the result: a command without an EE handler is still a completed DMA).
+        if (!packet || packetSize < 16u || packetSize > 112u)
+            return false;
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lock(m_postMutex);
+            PostedSifCommand posted;
+            posted.commandId = commandId;
+            posted.packet.assign(static_cast<const uint8_t *>(packet), static_cast<const uint8_t *>(packet) + packetSize);
+            m_posted.push_back(std::move(posted));
+            if (!m_postWakeQueued)
+            {
+                m_postWakeQueued = true;
+                wake = true;
+            }
+        }
+        m_postedTotal.fetch_add(1, std::memory_order_relaxed);
+        if (wake)
+            m_runtime.postEeEvent(EeEvent{EeEventType::Dmac, kIopPostedWorkEventId, 0u});
+        return true;
+    }
     uint8_t *const rdram = m_activeRdram
                                ? m_activeRdram
                                : m_runtime.memory().getRDRAM();
@@ -515,6 +606,60 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          commandId,
                                          packet,
                                          packetSize);
+}
+
+void PS2IopHostAdapter::drainPosted()
+{
+    // EE thread. Commands posted while this runs get their own wake-up event.
+    std::vector<PostedSifCommand> batch;
+    {
+        std::lock_guard<std::mutex> lock(m_postMutex);
+        batch.swap(m_posted);
+        m_postWakeQueued = false;
+    }
+    if (batch.empty())
+        return;
+    static const bool stats = []() {
+        const char *v = std::getenv("PS2X_IOP_THREAD_STATS");
+        return v && *v && v[0] != '0';
+    }();
+    if (stats)
+    {
+        static uint64_t drains = 0, commands = 0, maxBatch = 0;
+        static auto last = std::chrono::steady_clock::now();
+        ++drains;
+        commands += batch.size();
+        maxBatch = std::max<uint64_t>(maxBatch, batch.size());
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(5))
+        {
+            last = now;
+            std::fprintf(stderr, "[iop-thread] EE drains %llu, SIF commands %llu, max batch %llu\n",
+                         static_cast<unsigned long long>(drains), static_cast<unsigned long long>(commands),
+                         static_cast<unsigned long long>(maxBatch));
+        }
+    }
+    uint8_t *const rdram = m_runtime.memory().getRDRAM();
+    for (PostedSifCommand &command : batch)
+    {
+        if (command.work)
+        {
+            command.work();
+            continue;
+        }
+        (void)ps2_stubs::dispatchSifCommand(rdram,
+                                            &m_runtime,
+                                            command.commandId,
+                                            command.packet.data(),
+                                            command.packet.size());
+    }
+}
+
+void ps2IopDrainPosted(PS2Runtime &runtime)
+{
+    (void)runtime;
+    if (PS2IopHostAdapter *adapter = g_postAdapter.load(std::memory_order_acquire))
+        adapter->drainPosted();
 }
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
