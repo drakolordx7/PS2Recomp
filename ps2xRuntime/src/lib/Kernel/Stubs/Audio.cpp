@@ -1,5 +1,9 @@
 #include "Common.h"
 #include "Audio.h"
+#include "../../ps2_iop_transport.h"
+
+#include <chrono>
+#include <thread>
 
 namespace ps2_stubs
 {
@@ -54,6 +58,134 @@ namespace ps2_stubs
             g_audio_stub_state = {};
         }
 
+        // ---- libsd remote (sceSdRemote / sceSdRemoteInit) over the real SIF RPC -----------------------------------
+        // The recompiler binds the SDK's EE-side libsd client (sdr.c) to these stubs. With an emulated SDRDRV.IRX behind
+        // sid 0x80000701 the calls must reach it: a game that drives the SPU2 itself (Killzone's movie player uploads
+        // the FMV ADPCM and starts its voices this way) is otherwise silent. The code below is the client's argument
+        // packing (read from the game's copy of the library): the six arguments after the command go to a 0x40-byte
+        // buffer from word 1 (word 0 is overwritten by the reply), the call is a blocking sceSifCallRpc with the
+        // command as the RPC function number, and the first word of the reply is the return value.
+        constexpr uint32_t kLibSdSid = 0x80000701u;
+        constexpr uint32_t kSdrBufSize = 0x40u;
+
+        struct SdrRemoteState
+        {
+            uint32_t client = 0u;  // t_SifRpcClientData (0x40 bytes)
+            uint32_t buffer = 0u;  // send/reply buffer (0x40 bytes)
+            uint32_t scratch = 0u; // private stack for the SifCallRpc stack-argument reads
+            bool bound = false;
+        };
+        SdrRemoteState g_sdr;
+
+        bool sdrAllocate(PS2Runtime *runtime)
+        {
+            if (g_sdr.client != 0u)
+                return true;
+            const uint32_t base = runtime->guestMalloc(0x200u, 64u);
+            if (base == 0u)
+                return false;
+            g_sdr.client = base;
+            g_sdr.buffer = base + 0x80u;
+            g_sdr.scratch = base + 0x100u;
+            return true;
+        }
+
+        uint32_t sdrRead(uint8_t *rdram, uint32_t addr)
+        {
+            uint32_t v = 0u;
+            if (const uint8_t *p = getConstMemPtr(rdram, addr))
+                std::memcpy(&v, p, sizeof(v));
+            return v;
+        }
+
+        void sdrWrite(uint8_t *rdram, uint32_t addr, uint32_t v)
+        {
+            if (uint8_t *p = getMemPtr(rdram, addr))
+                std::memcpy(p, &v, sizeof(v));
+        }
+
+        void sdrCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t cmd,
+                     uint32_t sendBuf, uint32_t sendSize, uint32_t recvBuf, uint32_t recvSize)
+        {
+            R5900Context c = *ctx;
+            SET_GPR_U32(&c, 4, g_sdr.client);
+            SET_GPR_U32(&c, 5, cmd);
+            SET_GPR_U32(&c, 6, 0u); // blocking
+            SET_GPR_U32(&c, 7, sendBuf);
+            SET_GPR_U32(&c, 8, sendSize);
+            SET_GPR_U32(&c, 9, recvBuf);
+            SET_GPR_U32(&c, 10, recvSize);
+            SET_GPR_U32(&c, 11, 0u); // no end function
+            if (uint8_t *sp = getMemPtr(rdram, g_sdr.scratch))
+                std::memset(sp, 0, 0x40u);
+            SET_GPR_U32(&c, 29, g_sdr.scratch);
+            ps2_syscalls::SifCallRpc(rdram, &c, runtime);
+        }
+
+        // Returns true when the call went to the emulated SDRDRV.
+        bool sdrRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (!g_sdr.bound)
+                return false;
+            uint32_t cmd = getRegU32(ctx, 5);
+            // The six arguments after the command: a2, a3, t0..t3 (the SDK function takes all eight in registers).
+            const uint32_t a[6] = {getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8),
+                                   getRegU32(ctx, 9), getRegU32(ctx, 10), getRegU32(ctx, 11)};
+            uint8_t *buf = getMemPtr(rdram, g_sdr.buffer);
+            if (!buf)
+                return false;
+            std::memset(buf, 0, kSdrBufSize);
+            sdrWrite(rdram, g_sdr.buffer, g_sdr.buffer);
+            for (uint32_t i = 0; i < 6u; ++i)
+                sdrWrite(rdram, g_sdr.buffer + 4u + i * 4u, a[i]);
+
+            uint32_t result = 0u;
+            if (cmd == 0x8130u || cmd == 0x81A0u || cmd == 0x81B0u)
+            {
+                cmd |= a[0];
+                sdrCall(rdram, ctx, runtime, cmd, a[1], kSdrBufSize, g_sdr.buffer, 0x40u);
+                result = sdrRead(rdram, g_sdr.buffer);
+            }
+            else if (cmd == 0x8140u)
+            {
+                cmd |= a[0];
+                sdrCall(rdram, ctx, runtime, cmd, g_sdr.buffer, kSdrBufSize, a[1], 0x40u);
+            }
+            else if (cmd == 0x81C0u || cmd == 0x81D0u)
+            {
+                // sceSdProcBatch / sceSdProcBatchEx: batch table a[0] with a[1]+1 entries of 8 bytes, replies to a[2]
+                // (a[3] bytes), the extended form also passes a[4] in the table's second word.
+                if (uint8_t *b = getMemPtr(rdram, a[0] + 2u))
+                {
+                    const uint16_t n = static_cast<uint16_t>(a[1]);
+                    std::memcpy(b, &n, sizeof(n));
+                }
+                if (cmd == 0x81D0u)
+                    sdrWrite(rdram, a[0] + 4u, a[4]);
+                uint32_t rb = a[2], rs = a[3];
+                if (rb == 0u)
+                {
+                    rb = g_sdr.buffer;
+                    rs = 4u;
+                }
+                sdrCall(rdram, ctx, runtime, cmd, a[0], (a[1] + 1u) * 8u, rb, rs);
+                result = a[2] != 0u ? sdrRead(rdram, a[2]) : 0u;
+            }
+            else
+            {
+                uint32_t sendBuf = g_sdr.buffer, sendSize = kSdrBufSize;
+                if (cmd - 0x9000u <= 0xF0u)
+                {
+                    sendBuf = a[0];
+                    sendSize = a[1];
+                }
+                sdrCall(rdram, ctx, runtime, cmd, sendBuf, sendSize, g_sdr.buffer, 0x10u);
+                result = sdrRead(rdram, g_sdr.buffer);
+            }
+            setReturnU32(ctx, result);
+            return true;
+        }
+
         uint32_t currentBlockStatus(const BlockTransferState &transfer)
         {
             const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
@@ -76,7 +208,8 @@ namespace ps2_stubs
 
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
+        if (sdrRemote(rdram, ctx, runtime))
+            return;
 
         const uint32_t cmd = getRegU32(ctx, 5);
         const uint32_t cmdArg0 = getRegU32(ctx, 6);
@@ -196,8 +329,25 @@ namespace ps2_stubs
 
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-        (void)runtime;
+        // Bind to the emulated SDRDRV when there is one (the library's init loops on sceSifBindRpc until the server
+        // shows up; the IOP thread keeps running meanwhile). Without one the old stub model stays in charge.
+        g_sdr.bound = false;
+        static const bool s_remoteEnabled = [] { const char *v = std::getenv("PS2X_SDR_REMOTE"); return !(v && v[0] == '0'); }();
+        if (s_remoteEnabled && PS2IopTransport::canBindRpc(runtime, kLibSdSid) && sdrAllocate(runtime))
+        {
+            for (int attempt = 0; attempt < 2000 && !g_sdr.bound; ++attempt)
+            {
+                R5900Context c = *ctx;
+                SET_GPR_U32(&c, 4, g_sdr.client);
+                SET_GPR_U32(&c, 5, kLibSdSid);
+                SET_GPR_U32(&c, 6, 0u);
+                ps2_syscalls::SifBindRpc(rdram, &c, runtime);
+                if (sdrRead(rdram, g_sdr.client + 0x24u) != 0u)
+                    g_sdr.bound = true;
+                else
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
 
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
         resetAudioStubStateUnlocked();
