@@ -2916,6 +2916,24 @@ void PS2Runtime::run()
                       << " gsw=" << m_memory.gsWriteCount() << " vif=" << m_memory.vifWriteCount() << std::endl;
             if (ps2DmaStatsEnabled())
                 printDmaStatsDelta();
+            static const bool dumpThreads = std::getenv("PS2X_HEARTBEAT_THREADS") != nullptr; // debug: guest thread/semaphore table
+            if (dumpThreads)
+            {
+                for (const auto &th : ee.threads)
+                {
+                    if (th.status == EeThreadStatus::Dormant)
+                        continue;
+                    std::cerr << "  [thread] id=" << th.id << " st=" << static_cast<int>(th.status) << " wait=" << static_cast<int>(th.waitReason)
+                              << ":" << th.waitId << " prio=" << th.currentPriority << " entry=0x" << std::hex << th.entry << " pc=0x" << th.pc
+                              << " ra=0x" << th.ra << " sp=0x" << th.sp << std::dec << " wake=" << th.wakeupCount << std::endl;
+                }
+                for (const auto &sm : ee.semaphores)
+                    if (sm.waiters != 0u)
+                        std::cerr << "  [sema] id=" << sm.id << " count=" << sm.count << "/" << sm.maxCount << " waiters=" << sm.waiters << std::endl;
+                for (const auto &ef : ee.eventFlags)
+                    if (ef.waiters != 0u)
+                        std::cerr << "  [evflag] id=" << ef.id << " bits=0x" << std::hex << ef.bits << std::dec << " waiters=" << ef.waiters << std::endl;
+            }
             if (headless.shotDir.empty())
                 continue;
             gs().latchHostPresentationFrame();
