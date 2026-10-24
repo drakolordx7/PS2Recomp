@@ -4,6 +4,8 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace ps2x::iop::detail
@@ -30,10 +32,14 @@ namespace ps2x::iop::detail
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
+            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+                std::fprintf(stderr, "[iopmem] AllocSysMemory(flags %u, size %u) -> %06x ra=%08x\n", a0, a1, address, cpu.gpr[31]);
             setV0(address);
             return true;
         }
         case 5: // FreeSysMemory
+            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+                std::fprintf(stderr, "[iopmem] FreeSysMemory(%06x) ra=%08x\n", a0, cpu.gpr[31]);
             setV0(m_memory.freeAllocation(a0) ? 0u : 0xFFFFFFFFu);
             return true;
         case 6: // QueryMemSize
