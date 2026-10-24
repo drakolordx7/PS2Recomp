@@ -1543,6 +1543,47 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         }
     }
 
+    // Debug aid (issue #4): PS2X_MISSING_DUMP=1 prints every GPR, 0x80 bytes behind each register that points into RAM and the
+    // stack with the words that look like return addresses (guest code), on every missing target (not only the first).
+    {
+        static const bool dumpMissing = std::getenv("PS2X_MISSING_DUMP") != nullptr;
+        if (dumpMissing && rdram && ctx)
+        {
+            std::ostringstream d;
+            d << std::hex << "[missing-dump] target=0x" << targetPc << " source=0x" << sourcePc << " pc=0x" << pc << " ra=0x" << ra << " sp=0x" << sp;
+            static const char *const names[32] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                                                  "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+            for (int i = 1; i < 32; ++i)
+            {
+                const uint32_t v = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[i], 0));
+                d << "\n  " << names[i] << "=0x" << v;
+                if (v >= 0x1000u && v < PS2_RAM_SIZE - 0x80u && (v & 3u) == 0u && i != 29)
+                {
+                    d << " :";
+                    for (uint32_t o = 0; o < 0x80u; o += 4u)
+                    {
+                        uint32_t w = 0u;
+                        std::memcpy(&w, rdram + v + o, 4);
+                        if (o % 0x20u == 0u)
+                            d << "\n      +" << o << ":";
+                        d << " " << w;
+                    }
+                }
+            }
+            d << "\n  stack (words that point into guest code, offset from sp):";
+            for (uint32_t o = 0; o < 0x400u && sp + o + 4u <= PS2_RAM_SIZE; o += 4u)
+            {
+                uint32_t w = 0u;
+                std::memcpy(&w, rdram + sp + o, 4);
+                if (w >= 0x140000u && w < 0x55a674u && (w & 3u) == 0u)
+                    d << " +" << o << "=0x" << w;
+            }
+            static std::mutex s_missingDumpMutex;
+            std::lock_guard<std::mutex> lock(s_missingDumpMutex);
+            std::cerr << d.str() << std::endl;
+        }
+    }
+
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
     {
 #if defined(_MSC_VER)
