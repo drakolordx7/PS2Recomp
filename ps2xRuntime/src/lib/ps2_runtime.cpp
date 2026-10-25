@@ -1571,7 +1571,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                 }
             }
             d << "\n  stack (words that point into guest code, offset from sp):";
-            for (uint32_t o = 0; o < 0x400u && sp + o + 4u <= PS2_RAM_SIZE; o += 4u)
+            for (uint32_t o = 0; o < 0x400u && sp < PS2_RAM_SIZE && o + 4u <= PS2_RAM_SIZE - sp; o += 4u)
             {
                 uint32_t w = 0u;
                 std::memcpy(&w, rdram + sp + o, 4);

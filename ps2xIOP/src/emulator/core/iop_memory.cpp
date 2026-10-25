@@ -500,6 +500,27 @@ namespace ps2x::iop::detail
         return best;
     }
 
+    uint32_t IopMemory::totalFreeMemory() const
+    {
+        if (!heapReuse())
+            return m_heapCursor < heapEnd() ? heapEnd() - m_heapCursor : 0u;
+        // sum of all free gaps between the allocations
+        std::vector<Allocation> sorted(m_allocations);
+        std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        uint64_t total = 0;
+        uint32_t at = HeapBase;
+        const uint32_t end = heapEnd();
+        for (const auto &block : sorted)
+        {
+            if (block.address > at)
+                total += std::min(block.address, end) > at ? std::min(block.address, end) - at : 0u;
+            at = std::max(at, block.address + block.size);
+        }
+        if (end > at)
+            total += end - at;
+        return static_cast<uint32_t>(total);
+    }
+
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
     {
         const auto block = std::find_if(m_allocations.begin(), m_allocations.end(),

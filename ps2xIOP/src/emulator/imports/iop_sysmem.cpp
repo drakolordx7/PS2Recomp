@@ -10,6 +10,15 @@
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        bool memLog()
+        {
+            static const bool on = std::getenv("PS2X_IOP_MEMLOG") != nullptr;
+            return on;
+        }
+    }
+
     IopSysmem::IopSysmem(IopHost &host, IopMemory &memory) noexcept
         : m_host(host), m_memory(memory)
     {
@@ -32,13 +41,13 @@ namespace ps2x::iop::detail
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
-            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+            if (memLog())
                 std::fprintf(stderr, "[iopmem] AllocSysMemory(flags %u, size %u) -> %06x ra=%08x\n", a0, a1, address, cpu.gpr[31]);
             setV0(address);
             return true;
         }
         case 5: // FreeSysMemory
-            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+            if (memLog())
                 std::fprintf(stderr, "[iopmem] FreeSysMemory(%06x) ra=%08x\n", a0, cpu.gpr[31]);
             setV0(m_memory.freeAllocation(a0) ? 0u : 0xFFFFFFFFu);
             return true;
@@ -46,8 +55,10 @@ namespace ps2x::iop::detail
             setV0(IopMemory::RamSize);
             return true;
         case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
+            return true;
+        case 8: // QueryTotalFreeMemSize
+            setV0(m_memory.totalFreeMemory());
             return true;
         case 9: // QueryBlockTopAddress
             if (const auto block = m_memory.allocationContaining(a0))

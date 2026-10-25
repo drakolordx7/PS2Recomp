@@ -8,6 +8,15 @@
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        bool memLog()
+        {
+            static const bool on = std::getenv("PS2X_IOP_MEMLOG") != nullptr;
+            return on;
+        }
+    }
+
     IopHeaplib::IopHeaplib(IopMemory &memory) noexcept
         : m_memory(memory)
     {
@@ -34,11 +43,11 @@ namespace ps2x::iop::detail
             return true;
         case 6:
             setV0(m_memory.allocate(a1, 16u));
-            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+            if (memLog())
                 std::fprintf(stderr, "[iopmem] heaplib Malloc(%u) -> %06x ra=%08x\n", a1, cpu.gpr[2], cpu.gpr[31]);
             return true;
         case 7:
-            if (std::getenv("PS2X_IOP_MEMLOG") != nullptr)
+            if (memLog())
                 std::fprintf(stderr, "[iopmem] heaplib Free(%06x) ra=%08x\n", a1, cpu.gpr[31]);
             setV0(m_memory.freeAllocation(a1) ? 0u : 0xFFFFFFFFu);
             return true;
