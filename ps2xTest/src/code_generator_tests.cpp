@@ -191,6 +191,144 @@ void register_code_generator_tests()
                  "the registration source must use the same unambiguous stub header");
     });
 
+    tc.Run("symbol prefix applies to definitions, direct calls and the table", [](TestCase &t) {
+        Function caller;
+        caller.name = "caller";
+        caller.start = 0x4000;
+        caller.end = 0x4008;
+        caller.isRecompiled = true;
+
+        Function target;
+        target.name = "target";
+        target.start = 0x5000;
+        target.end = 0x5008;
+        target.isRecompiled = true;
+
+        Instruction j{};
+        j.address = 0x4000;
+        j.opcode = OPCODE_J;
+        j.target = (0x5000u >> 2) & 0x3FFFFFFu;
+        j.hasDelaySlot = true;
+        j.raw = (OPCODE_J << 26) | (j.target & 0x3FFFFFFu);
+
+        std::vector<Section> sections = {
+            {".text", 0x4000u, 0x2000u, 0u, true, false, false, true, nullptr}
+        };
+        CodeGenerator gen({}, sections);
+        gen.setRenamedFunctions({{caller.start, "caller_0x4000"}, {target.start, "target_0x5000"}});
+
+        const std::string unprefixed = gen.generateFunction(caller, {j, makeNop(0x4004)}, false);
+        t.IsTrue(unprefixed.find("void caller_0x4000(") != std::string::npos,
+                 "without a prefix the definition keeps its plain name");
+        t.IsTrue(unprefixed.find("target_0x5000(rdram, ctx, runtime); return;") != std::string::npos,
+                 "without a prefix the tail call keeps its plain name");
+
+        gen.setSymbolPrefix("pal_");
+        t.Equals(gen.getFunctionName(0x5000u), std::string("pal_target_0x5000"),
+                 "getFunctionName must apply the prefix");
+        t.Equals(gen.getFunctionName(0x6000u), std::string(),
+                 "an unknown address must stay unnamed (no bare prefix)");
+
+        const std::string generated = gen.generateFunction(caller, {j, makeNop(0x4004)}, false);
+        t.IsTrue(generated.find("void pal_caller_0x4000(") != std::string::npos,
+                 "the definition must carry the prefix");
+        t.IsTrue(generated.find("pal_target_0x5000(rdram, ctx, runtime); return;") != std::string::npos,
+                 "the direct tail call must carry the prefix");
+        t.IsTrue(generated.find(" target_0x5000(") == std::string::npos,
+                 "no unprefixed call may remain");
+
+        const std::string registration = gen.generateFunctionRegistration({caller, target}, {});
+        t.IsTrue(registration.find("= pal_caller_0x4000; // 0x4000") != std::string::npos,
+                 "table entries must reference the prefixed definitions");
+        t.IsTrue(registration.find("= pal_target_0x5000; // 0x5000") != std::string::npos,
+                 "table entries must reference the prefixed definitions");
+    });
+
+    tc.Run("register-function mode emits no table globals and no static initializer", [](TestCase &t) {
+        Function owner;
+        owner.name = "owner";
+        owner.start = 0x140000;
+        owner.end = 0x140010;
+        owner.isRecompiled = true;
+
+        Function other;
+        other.name = "other";
+        other.start = 0x140020;
+        other.end = 0x140028;
+        other.isRecompiled = true;
+
+        CodeGenerator gen({}, {});
+        gen.setSymbolPrefix("pal_");
+        gen.setRenamedFunctions({{owner.start, "owner_0x140000"}, {other.start, "other_0x140020"}});
+        gen.setResumeEntryTargets({{owner.start, {0x140008u}}});
+        gen.setFunctionTableOptions("kzPalRegisterFunctions", 0u);
+
+        const std::string registration = gen.generateFunctionRegistration({owner, other}, {});
+        printGeneratedCode("register-function mode", registration);
+
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable") == std::string::npos,
+                 "register mode must not define the global table or its Base/End/SlotCount");
+        t.IsTrue(registration.find("GeneratedFunctionTableInitializer") == std::string::npos &&
+                     registration.find("static ") == std::string::npos,
+                 "register mode must not have a static initializer");
+        t.IsTrue(registration.find("void kzPalRegisterFunctions(PS2Runtime::RecompiledFunction* table, uint32_t base, "
+                                   "uint32_t slotCount) {") != std::string::npos,
+                 "register mode must define the named register function");
+        t.IsTrue(registration.find("extern const uint32_t kzPalRegisterFunctionsEnd = 0x140024u;") != std::string::npos,
+                 "register mode must define the set's own End");
+        t.IsTrue(registration.find("table[i] = nullptr;") != std::string::npos,
+                 "the register function must clear every slot first");
+        t.IsTrue(registration.find("std::abort();") != std::string::npos &&
+                     registration.find("base > 0x140000u") != std::string::npos &&
+                     registration.find("((0x140024u - base) >> 2) > slotCount") != std::string::npos,
+                 "the register function must abort when the set's range does not fit");
+        t.IsTrue(registration.find("table[(0x140000u - base) >> 2] = pal_owner_0x140000;") != std::string::npos,
+                 "function starts must fill slots relative to the passed base");
+        t.IsTrue(registration.find("table[(0x140008u - base) >> 2] = pal_owner_0x140000;") != std::string::npos,
+                 "resume entries must fill slots relative to the passed base");
+        t.IsTrue(registration.find("table[(0x140020u - base) >> 2] = pal_other_0x140020;") != std::string::npos,
+                 "every function start must be registered");
+    });
+
+    tc.Run("table_end_min raises End and SlotCount", [](TestCase &t) {
+        Function func;
+        func.name = "only";
+        func.start = 0x140000;
+        func.end = 0x140008;
+        func.isRecompiled = true;
+
+        CodeGenerator gen({}, {});
+        gen.setRenamedFunctions({{func.start, "only_0x140000"}});
+
+        const std::string plain = gen.generateFunctionRegistration({func}, {});
+        t.IsTrue(plain.find("g_ps2RecompiledFunctionTableEnd = 0x140004u;") != std::string::npos &&
+                     plain.find("g_ps2RecompiledFunctionTableSlotCount = 1u;") != std::string::npos,
+                 "without table_end_min End follows the last entry");
+
+        gen.setFunctionTableOptions("", 0x140100u);
+        const std::string raised = gen.generateFunctionRegistration({func}, {});
+        t.IsTrue(raised.find("g_ps2RecompiledFunctionTableBase = 0x140000u;") != std::string::npos,
+                 "table_end_min must not move the base");
+        t.IsTrue(raised.find("g_ps2RecompiledFunctionTableEnd = 0x140100u;") != std::string::npos,
+                 "End must be raised to table_end_min");
+        t.IsTrue(raised.find("g_ps2RecompiledFunctionTableSlotCount = 64u;") != std::string::npos,
+                 "SlotCount must follow the raised End");
+        t.IsTrue(raised.find("g_ps2RecompiledFunctionTable[64u] = {};") != std::string::npos,
+                 "the table array must be sized for the raised End");
+
+        gen.setFunctionTableOptions("", 0x140002u);
+        const std::string lower = gen.generateFunctionRegistration({func}, {});
+        t.IsTrue(lower.find("g_ps2RecompiledFunctionTableEnd = 0x140004u;") != std::string::npos,
+                 "a table_end_min below the computed End must not shrink it");
+
+        gen.setFunctionTableOptions("kzRegister", 0x140100u);
+        const std::string reg = gen.generateFunctionRegistration({func}, {});
+        t.IsTrue(reg.find("extern const uint32_t kzRegisterEnd = 0x140100u;") != std::string::npos,
+                 "register mode must emit the raised End");
+        t.IsTrue(reg.find("((0x140004u - base) >> 2) > slotCount") != std::string::npos,
+                 "the fit check must use the set's own entries, not the raised End");
+    });
+
     tc.Run("unsigned integer loads use explicit zero extension", [](TestCase &t) {
         CodeGenerator gen({}, {});
         const std::string lbu = gen.translateInstruction(makeIType(0x8F10, OPCODE_LBU, 1, 2, 0x10));

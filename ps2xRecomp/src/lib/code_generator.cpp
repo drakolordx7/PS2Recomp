@@ -213,21 +213,39 @@ namespace ps2recomp
         m_reporter = reporter;
     }
 
+    void CodeGenerator::setSymbolPrefix(const std::string &prefix)
+    {
+        m_symbolPrefix = prefix;
+    }
+
+    void CodeGenerator::setFunctionTableOptions(const std::string &registerFunctionName, uint32_t tableEndMin)
+    {
+        m_tableRegisterFunction = registerFunctionName;
+        m_tableEndMin = tableEndMin;
+    }
+
     std::string CodeGenerator::getFunctionName(uint32_t address) const
     {
+        std::string name;
         auto it = m_renamedFunctions.find(address);
         if (it != m_renamedFunctions.end())
         {
-            return it->second;
+            name = it->second;
         }
-
-        const Symbol *sym = findSymbolByAddress(address);
-        if (sym && sym->isFunction)
+        else
         {
-            return CodeGenerator::sanitizeFunctionName(sym->name);
+            const Symbol *sym = findSymbolByAddress(address);
+            if (sym && sym->isFunction)
+            {
+                name = CodeGenerator::sanitizeFunctionName(sym->name);
+            }
         }
 
-        return "";
+        if (name.empty() || m_symbolPrefix.empty())
+        {
+            return name;
+        }
+        return m_symbolPrefix + name;
     }
 
     std::string CodeGenerator::sanitizeFunctionName(const std::string &name) const

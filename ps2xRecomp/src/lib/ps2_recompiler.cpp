@@ -1000,6 +1000,8 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            m_codeGenerator->setSymbolPrefix(m_config.symbolPrefix);
+            m_codeGenerator->setFunctionTableOptions(m_config.tableRegisterFunction, m_config.tableEndMin);
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
@@ -1240,11 +1242,11 @@ namespace ps2recomp
                     auto renameIt = m_functionRenames.find(entryIt->start);
                     if (renameIt != m_functionRenames.end())
                     {
-                        m_bootstrapInfo.entryName = renameIt->second;
+                        m_bootstrapInfo.entryName = m_config.symbolPrefix + renameIt->second;
                     }
                     else
                     {
-                        m_bootstrapInfo.entryName = sanitizeFunctionName(entryIt->name);
+                        m_bootstrapInfo.entryName = m_config.symbolPrefix + sanitizeFunctionName(entryIt->name);
                     }
                 }
 

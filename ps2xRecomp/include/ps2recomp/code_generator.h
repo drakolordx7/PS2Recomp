@@ -56,6 +56,10 @@ namespace ps2recomp
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
+        // Prefix for every generated guest-code symbol; getFunctionName() applies it.
+        void setSymbolPrefix(const std::string &prefix);
+        // Register-function mode and minimum End for register_functions.cpp (see RecompilerConfig).
+        void setFunctionTableOptions(const std::string &registerFunctionName, uint32_t tableEndMin);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
@@ -72,6 +76,9 @@ namespace ps2recomp
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
+        std::string m_symbolPrefix;
+        std::string m_tableRegisterFunction;
+        uint32_t m_tableEndMin = 0;
 
         // Register-locals code generation (runtime side: ps2_cg.h). PS2X_CODEGEN=locals enables it for every
         // function; PS2X_CODEGEN_FUNCS=<file> (one hex start address per line) restricts it to those functions.
