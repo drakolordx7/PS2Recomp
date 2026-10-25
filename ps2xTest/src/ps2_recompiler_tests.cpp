@@ -1331,6 +1331,43 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove(configPath, removeError);
         });
 
+        tc.Run("config manager parses symbol_prefix, table_register_function and table_end_min", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path configPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-dual-set-" + uniqueSuffix + ".toml");
+
+            {
+                std::ofstream configFile(configPath);
+                t.IsTrue(static_cast<bool>(configFile), "temp config file should be writable");
+                configFile << "[general]\n";
+                configFile << "input = \"dummy.elf\"\n";
+                configFile << "output = \"out\"\n";
+                configFile << "symbol_prefix = \"pal_\"\n";
+                configFile << "table_register_function = \"kzPalRegisterFunctions\"\n";
+                configFile << "table_end_min = 0x5A0000\n";
+            }
+            RecompilerConfig config = ConfigManager(configPath.string()).loadConfig();
+            t.Equals(config.symbolPrefix, std::string("pal_"), "symbol_prefix should parse");
+            t.Equals(config.tableRegisterFunction, std::string("kzPalRegisterFunctions"),
+                     "table_register_function should parse");
+            t.Equals(config.tableEndMin, 0x5A0000u, "table_end_min should parse");
+
+            {
+                std::ofstream configFile(configPath, std::ios::trunc);
+                configFile << "[general]\n";
+                configFile << "input = \"dummy.elf\"\n";
+                configFile << "output = \"out\"\n";
+            }
+            RecompilerConfig defaults = ConfigManager(configPath.string()).loadConfig();
+            t.IsTrue(defaults.symbolPrefix.empty() && defaults.tableRegisterFunction.empty() &&
+                         defaults.tableEndMin == 0u,
+                     "the keys must default to today's behaviour");
+
+            std::error_code removeError;
+            std::filesystem::remove(configPath, removeError);
+        });
+
         tc.Run("config manager loads modern and legacy guest entry hints", [](TestCase &t) {
             const auto uniqueSuffix = std::to_string(
                 static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));

@@ -137,21 +137,67 @@ namespace ps2recomp
 
         uint32_t tableBase = 0u;
         uint32_t tableEnd = 0u;
-        uint32_t slotCount = 0u;
         if (!entries.empty())
         {
             tableBase = entries.front().first & ~3u;
             tableEnd = (entries.back().first + 4u + 3u) & ~3u;
-            slotCount = (tableEnd - tableBase) >> 2;
         }
+        // The set's own range; the register function checks it against the table it is given.
+        const uint32_t entriesEnd = tableEnd;
+        if (cg.m_tableEndMin != 0u)
+        {
+            const uint32_t endMin = static_cast<uint32_t>((static_cast<uint64_t>(cg.m_tableEndMin) + 3u) & ~uint64_t{3});
+            if (endMin < tableBase)
+            {
+                std::ostringstream oss;
+                oss << "table_end_min 0x" << std::hex << cg.m_tableEndMin << " is below the table base 0x" << tableBase;
+                throw std::runtime_error(oss.str());
+            }
+            tableEnd = std::max(tableEnd, endMin);
+        }
+        const uint32_t slotCount = (tableEnd - tableBase) >> 2;
 
         std::stringstream ss;
         ss << "#include \"ps2_runtime.h\"\n";
         ss << "#include <ps2_recompiled_functions.h>\n";
         ss << "#include \"ps2_stubs.h\"\n";
         ss << "#include <ps2_recompiled_stubs.h>\n";
-        ss << "#include \"ps2_syscalls.h\"\n\n";
+        ss << "#include \"ps2_syscalls.h\"\n";
 
+        if (!cg.m_tableRegisterFunction.empty())
+        {
+            // Register-function mode: no table globals and no static initializer. The runtime owns the table and
+            // calls this function for the set it selected; slots are relative to the base it passes.
+            const std::string &fn = cg.m_tableRegisterFunction;
+            ss << "#include <cstdio>\n";
+            ss << "#include <cstdlib>\n\n";
+            ss << "extern const uint32_t " << fn << "End = 0x" << std::hex << tableEnd << "u;\n\n";
+            ss << "void " << fn << "(PS2Runtime::RecompiledFunction* table, uint32_t base, uint32_t slotCount) {\n";
+            ss << "    if (slotCount != 0u && table == nullptr) {\n";
+            ss << "        std::fprintf(stderr, \"" << fn << ": null function table\\n\");\n";
+            ss << "        std::abort();\n";
+            ss << "    }\n";
+            ss << "    for (uint32_t i = 0; i < slotCount; ++i) {\n";
+            ss << "        table[i] = nullptr;\n";
+            ss << "    }\n";
+            if (!entries.empty())
+            {
+                ss << "    if ((base & 3u) != 0u || base > 0x" << tableBase << "u || ((0x" << entriesEnd
+                   << "u - base) >> 2) > slotCount) {\n";
+                ss << "        std::fprintf(stderr, \"" << fn << ": set range 0x" << tableBase << "-0x" << entriesEnd
+                   << " does not fit a table at base 0x%x with %u slots\\n\", base, slotCount);\n";
+                ss << "        std::abort();\n";
+                ss << "    }\n";
+            }
+            for (const auto &[address, name] : entries)
+            {
+                ss << "    table[(0x" << address << "u - base) >> 2] = " << name << ";\n";
+            }
+            ss << "}\n";
+            return ss.str();
+        }
+
+        ss << "\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x" << std::hex << tableBase << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = " << std::dec << slotCount << "u;\n";

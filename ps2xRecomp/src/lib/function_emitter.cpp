@@ -290,7 +290,7 @@ namespace ps2recomp
         if (sanitizedName.empty())
         {
             std::stringstream nameBuilder;
-            nameBuilder << "Errorfunc_" << std::hex << function.start;
+            nameBuilder << cg.m_symbolPrefix << "Errorfunc_" << std::hex << function.start;
             sanitizedName = nameBuilder.str();
         }
 

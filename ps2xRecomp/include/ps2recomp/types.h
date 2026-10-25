@@ -184,6 +184,14 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        // Prepended to every C++ symbol generated for guest code (definitions, direct calls, prototypes, stub
+        // wrappers), so two recompiled sets can link into one executable. Runtime symbols are not prefixed.
+        std::string symbolPrefix;
+        // When set, register_functions.cpp defines `void <name>(table, base, slotCount)` and `<name>End` instead of
+        // the g_ps2RecompiledFunctionTable globals and their static initializer.
+        std::string tableRegisterFunction;
+        // The emitted table End is max(computed End, this value); SlotCount follows.
+        uint32_t tableEndMin = 0;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

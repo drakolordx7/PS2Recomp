@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <thread>
 
@@ -64,6 +65,44 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+            config.symbolPrefix = toml::find_or<std::string>(general, "symbol_prefix", config.symbolPrefix);
+            config.tableRegisterFunction =
+                toml::find_or<std::string>(general, "table_register_function", config.tableRegisterFunction);
+            auto requireIdentifier = [](const std::string &value, const char *key)
+            {
+                if (value.empty())
+                    return;
+                const bool validChars = std::all_of(value.begin(), value.end(), [](unsigned char c)
+                                                    { return std::isalnum(c) || c == '_'; });
+                if (!validChars || std::isdigit(static_cast<unsigned char>(value.front())))
+                {
+                    throw std::runtime_error(std::string(key) + " must be a C++ identifier: '" + value + "'");
+                }
+            };
+            requireIdentifier(config.symbolPrefix, "symbol_prefix");
+            requireIdentifier(config.tableRegisterFunction, "table_register_function");
+            if (general.contains("table_end_min"))
+            {
+                const auto &endMinValue = general.at("table_end_min");
+                int64_t endMin = 0;
+                if (endMinValue.is_integer())
+                {
+                    endMin = endMinValue.as_integer();
+                }
+                else if (endMinValue.is_string())
+                {
+                    endMin = static_cast<int64_t>(std::stoull(endMinValue.as_string(), nullptr, 0));
+                }
+                else
+                {
+                    throw std::runtime_error("table_end_min must be an integer or a numeric string");
+                }
+                if (endMin < 0 || endMin > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+                {
+                    throw std::runtime_error("table_end_min is out of the 32-bit address range");
+                }
+                config.tableEndMin = static_cast<uint32_t>(endMin);
+            }
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -295,6 +334,12 @@ namespace ps2recomp
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
+        if (!config.symbolPrefix.empty())
+            general["symbol_prefix"] = config.symbolPrefix;
+        if (!config.tableRegisterFunction.empty())
+            general["table_register_function"] = config.tableRegisterFunction;
+        if (config.tableEndMin != 0u)
+            general["table_end_min"] = static_cast<int64_t>(config.tableEndMin);
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;

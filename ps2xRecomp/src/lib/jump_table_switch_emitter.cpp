@@ -28,7 +28,7 @@ namespace ps2recomp
             }
             else
             {
-                ss << "        func_" << std::hex << target << std::dec << "(rdram, ctx,  runtime);\n";
+                ss << "        " << m_symbolPrefix << "func_" << std::hex << target << std::dec << "(rdram, ctx,  runtime);\n";
             }
 
             ss << "        return;\n";
