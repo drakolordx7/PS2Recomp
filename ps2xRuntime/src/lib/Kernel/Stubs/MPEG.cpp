@@ -2,6 +2,9 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_gs.h"
+#include "runtime/ps2_mpeg_pacing.h"
+
+#include <chrono>
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -562,6 +565,11 @@ namespace ps2_stubs
             uint64_t pausedDts = 0xFFFFFFFFFFFFFFFFull;
             std::vector<MpegRegisteredCallback> pausedCallbacks;
             std::deque<MpegDecodedFrame> decodedFrames;
+            // The picture GetPicture handed out last. A GetPicture that returns without a new picture writes it again:
+            // the game counts the call as a new picture and shows the image buffer it passed, which (double-buffered)
+            // still holds the picture before the last one, so the movie would jump back a frame.
+            std::shared_ptr<const MpegDecodedFrame> lastFrame;
+            uint64_t lastServedTick = 0u;
             std::unique_ptr<MpegFfmpegDecoder> decoder;
             uint8_t frameRateCode = 0u;
             uint8_t frameRateExtensionN = 0u;
@@ -609,6 +617,61 @@ namespace ps2_stubs
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
+
+        // PS2X_MPEG_STATS=1: once per wall-clock second of movie playback, the picture cadence (debug aid, under
+        // g_mpeg_stub_mutex): pictures served, GetPicture calls that returned without a new picture, vsync waits
+        // inside GetPicture, NoData callbacks, mpegPictureDue answers, the largest gap between two pictures and the
+        // gaps longer than the movie's picture interval (rounded up to whole vsync ticks), and the decode time.
+        struct MpegStats
+        {
+            std::chrono::steady_clock::time_point start{};
+            uint64_t startTick = 0u;
+            bool running = false;
+            uint32_t served = 0u, noFrame = 0u, vsyncWaits = 0u, nodata = 0u, due = 0u, notDue = 0u, late = 0u;
+            uint64_t waitTicks = 0u, maxGapTicks = 0u, decodeUs = 0u, intervalQ32 = 0u;
+        };
+        MpegStats g_mpeg_stats;
+
+        bool mpegStatsEnabled()
+        {
+            static const bool s_on = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_STATS");
+                return v && *v && *v != '0';
+            }();
+            return s_on;
+        }
+
+        void mpegStatsTick(uint64_t tick)
+        {
+            MpegStats &s = g_mpeg_stats;
+            const auto now = std::chrono::steady_clock::now();
+            if (!s.running)
+            {
+                s = MpegStats{};
+                s.running = true;
+                s.start = now;
+                s.startTick = tick;
+                return;
+            }
+            const double wall = std::chrono::duration<double>(now - s.start).count();
+            if (wall < 1.0)
+                return;
+            std::fprintf(stderr,
+                         "[MPEG:stats] %.2f s, %llu vsync ticks: %u pictures (%.2f/s), %u without a new picture, "
+                         "%u vsync waits (%llu ticks), %u nodata, due %u / not due %u, max gap %llu ticks "
+                         "(interval %.2f), %u late, decode %.1f ms\n",
+                         wall, static_cast<unsigned long long>(tick - s.startTick), s.served, s.served / wall,
+                         s.noFrame, s.vsyncWaits, static_cast<unsigned long long>(s.waitTicks), s.nodata, s.due,
+                         s.notDue, static_cast<unsigned long long>(s.maxGapTicks),
+                         static_cast<double>(s.intervalQ32) / 4294967296.0, s.late, s.decodeUs / 1000.0);
+            const uint64_t interval = s.intervalQ32;
+            s = MpegStats{};
+            s.running = true;
+            s.start = now;
+            s.startTick = tick;
+            s.intervalQ32 = interval;
+        }
 
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
@@ -1190,7 +1253,13 @@ namespace ps2_stubs
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
             }
 
-            if (!playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k))
+            const auto decodeStart = mpegStatsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool fed = playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k);
+            if (mpegStatsEnabled())
+                g_mpeg_stats.decodeUs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                   std::chrono::steady_clock::now() - decodeStart)
+                                                                   .count());
+            if (!fed)
             {
                 playback.decoder.reset();
                 playback.waitingForVideoSequenceHeader = true;
@@ -2624,6 +2693,36 @@ namespace ps2_stubs
 
         constexpr uint32_t kMpegCbNodata = 1u; // sceMpegCbNodata
         bool s_nodataMadeNoProgress = false;    // set for the retry after a callback that demuxed nothing
+        constexpr size_t kNodataReadAheadPictures = 4u;
+
+        // PS2X_MPEG_READAHEAD=0 turns the NoData read-ahead in sceMpegGetPicture off.
+        bool mpegNodataReadAheadDisabled()
+        {
+            static const bool s_off = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_READAHEAD");
+                return v && v[0] == '0';
+            }();
+            return s_off;
+        }
+
+        // The handle's sceMpegCbNodata callback (the last one registered), 0 when none. Under g_mpeg_stub_mutex.
+        uint32_t mpegNodataCallback(uint32_t mpegAddr, uint32_t &data)
+        {
+            uint32_t func = 0u;
+            if (const auto cbs = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr); cbs != g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                for (const MpegRegisteredCallback &cb : cbs->second)
+                {
+                    if (!cb.stream && cb.type == kMpegCbNodata)
+                    {
+                        func = cb.func;
+                        data = cb.data;
+                    }
+                }
+            }
+            return func;
+        }
 
         // Runs the game's sceMpegCbNodata callback on the current thread, then retries sceMpegGetPicture.
         // The callback typically demuxes more of the stream and sends the next part of the video bitstream to the
@@ -2651,6 +2750,7 @@ namespace ps2_stubs
             {
                 std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
                 bytesBefore = g_mpeg_stub_state.pssBytesAppended;
+                ++g_mpeg_stats.nodata;
             }
             invocation.onComplete = [rdram, runtime, cbDataAddr, bytesBefore](const R5900Context &, R5900Context &parent)
             {
@@ -2680,11 +2780,12 @@ namespace ps2_stubs
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
-        bool haveFrame = false;
-        MpegDecodedFrame frame;
+        std::shared_ptr<const MpegDecodedFrame> frame; // the picture to write: a new one, or the last one again
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (mpegStatsEnabled())
+                mpegStatsTick(runtime->eeScheduler().currentVSyncTick());
             if (playback.decodedFrames.empty() && playback.sawSequenceEnd && !playback.streamEnded)
             {
                 // The video bitstream ended (sequence_end_code): libmpeg stops requesting data here, and the game's
@@ -2735,7 +2836,12 @@ namespace ps2_stubs
                 {
                     // The callback had nothing to demux yet (the stream read is asynchronous). Return without a new
                     // picture instead of parking the only thread that can demux; the game calls again next frame.
+                    // It takes the call as a new picture, so the last one is written again (see lastFrame).
+                    std::shared_ptr<const MpegDecodedFrame> repeat = playback.lastFrame;
+                    ++g_mpeg_stats.noFrame;
                     lock.unlock();
+                    if (repeat)
+                        writeDecodedFrameToGuest(rdram, imageAddr, *repeat);
                     setReturnS32(ctx, 0);
                     return;
                 }
@@ -2756,6 +2862,30 @@ namespace ps2_stubs
                         }
                         sceMpegGetPicture(rdram, &resumeContext, runtime);
                     });
+            }
+
+            // Read-ahead for games that demux only from the NoData callback (no sceCdSt stream; Killzone). Called only
+            // when the queue is empty, the callback often finds the game's asynchronous stream read not done yet, and
+            // that picture is lost (the call above returns without one): about half of them in Killzone's movies, so
+            // they ran at 24 instead of 29.97 pictures per second with uneven gaps. While fewer than
+            // kNodataReadAheadPictures are decoded, call it before serving too, again after each call that demuxed
+            // something, so the reads run ahead of the pictures.
+            if (!playback.decodedFrames.empty())
+            {
+                const bool lastMadeNoProgress = s_nodataMadeNoProgress;
+                s_nodataMadeNoProgress = false;
+                if (!lastMadeNoProgress && playback.decodedFrames.size() < kNodataReadAheadPictures &&
+                    g_mpeg_stub_state.cdStreamGeneration == 0u && !playback.streamEnded && !playback.sawSequenceEnd &&
+                    !playback.decoderFailed && !mpegNodataReadAheadDisabled())
+                {
+                    uint32_t nodataData = 0u;
+                    const uint32_t nodataFunc = mpegNodataCallback(mpegAddr, nodataData);
+                    if (nodataFunc != 0u && runtime->hasFunction(nodataFunc))
+                    {
+                        lock.unlock();
+                        invokeNodataCallback(rdram, ctx, runtime, mpegAddr, nodataFunc, nodataData);
+                    }
+                }
             }
 
             if (!playback.decodedFrames.empty())
@@ -2780,6 +2910,8 @@ namespace ps2_stubs
                 if (currentTickQ32 < presentationTargetQ32)
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
+                    ++g_mpeg_stats.vsyncWaits;
+                    g_mpeg_stats.waitTicks += eligibleTick - currentTick;
                     lock.unlock();
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
@@ -2794,17 +2926,27 @@ namespace ps2_stubs
                         });
                 }
 
-                frame = std::move(playback.decodedFrames.front());
+                frame = std::make_shared<const MpegDecodedFrame>(std::move(playback.decodedFrames.front()));
                 playback.decodedFrames.pop_front();
-                playback.width = static_cast<uint32_t>(frame.width);
-                playback.height = static_cast<uint32_t>(frame.height);
+                playback.lastFrame = frame;
+                if (playback.picturesServed != 0u)
+                {
+                    const uint64_t gap = currentTick - playback.lastServedTick;
+                    g_mpeg_stats.maxGapTicks = std::max(g_mpeg_stats.maxGapTicks, gap);
+                    if (gap > ((frameIntervalQ32 + kPictureClockOne - 1u) >> 32u))
+                        ++g_mpeg_stats.late;
+                }
+                playback.lastServedTick = currentTick;
+                ++g_mpeg_stats.served;
+                g_mpeg_stats.intervalQ32 = frameIntervalQ32;
+                playback.width = static_cast<uint32_t>(frame->width);
+                playback.height = static_cast<uint32_t>(frame->height);
                 width = playback.width;
                 height = playback.height;
                 frameCount = playback.picturesServed;
                 playback.picturesServed += 1u;
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
-                haveFrame = true;
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
@@ -2822,6 +2964,9 @@ namespace ps2_stubs
                 width = playback.width;
                 height = playback.height;
                 frameCount = playback.picturesServed;
+                frame = playback.lastFrame;
+                if (frame)
+                    ++g_mpeg_stats.noFrame;
                 publishMpegEndFlag(rdram, mpegAddr, playback, runtime);
             }
         }
@@ -2843,9 +2988,9 @@ namespace ps2_stubs
             }
         }
 
-        if (haveFrame)
+        if (frame)
         {
-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
+            writeDecodedFrameToGuest(rdram, imageAddr, *frame);
         }
         else if (frameCount == 0u)
         {
@@ -2853,6 +2998,40 @@ namespace ps2_stubs
         }
 
         setReturnS32(ctx, 0);
+    }
+
+    bool mpegPictureDue(uint32_t mpegAddr, uint64_t vsyncTick)
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        bool due = true;
+        const auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+        if (it != g_mpeg_stub_state.playbackByMpeg.end() && it->second.picturesServed != 0u)
+        {
+            // The same target sceMpegGetPicture presents the next picture at (presentationTickForFrame, without its
+            // side effects): from the PTS of the next decoded picture, or one picture interval after the last one.
+            const MpegPlaybackState &playback = it->second;
+            uint64_t target = playback.nextPictureTickQ32;
+            if (!playback.decodedFrames.empty())
+            {
+                const MpegDecodedFrame &next = playback.decodedFrames.front();
+                if (next.pts90k >= 0 && playback.firstPresentedPts90k >= 0)
+                {
+                    const int64_t delta = mpegPtsDelta90k(playback.firstPresentedPts90k, next.pts90k);
+                    if (delta >= 0)
+                    {
+                        target = playback.ptsPresentationBaseTickQ32 + mpegPtsDeltaToVSyncQ32(static_cast<uint64_t>(delta));
+                    }
+                    else
+                    {
+                        const uint64_t backwards = mpegPtsDeltaToVSyncQ32(static_cast<uint64_t>(-delta));
+                        target = playback.ptsPresentationBaseTickQ32 > backwards ? playback.ptsPresentationBaseTickQ32 - backwards : 0u;
+                    }
+                }
+            }
+            due = target == std::numeric_limits<uint64_t>::max() || (vsyncTick << 32u) >= target;
+        }
+        ++(due ? g_mpeg_stats.due : g_mpeg_stats.notDue);
+        return due;
     }
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
