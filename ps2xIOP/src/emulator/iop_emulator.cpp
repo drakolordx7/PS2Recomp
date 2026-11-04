@@ -558,7 +558,17 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t used = runCpu(cpu, budget);
+            if (!cpu.stopped && !cpu.yielded && used >= budget)
+            {
+                static uint32_t reported = 0;
+                if (reported < 50u)
+                {
+                    ++reported;
+                    std::fprintf(stderr, "[IOP] call 0x%x ran out of its %u-instruction budget at pc=0x%x ra=0x%x\n",
+                                 address, budget, cpu.pc, cpu.gpr[31]);
+                }
+            }
             return cpu.gpr[2];
         }
 

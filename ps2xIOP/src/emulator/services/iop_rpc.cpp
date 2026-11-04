@@ -7,6 +7,7 @@
 #include "../iop_trace.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -339,12 +340,30 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        // The server function runs synchronously here, while on a real IOP it runs in the module's RPC thread with no
+        // time limit. The default call budget (2M instructions) cut long requests off half way: Killzone's sound
+        // driver (PSOUND_R, fn 0x600) gets the level unload as one command batch and every FreeSample scans its
+        // 1000-entry SPU allocation table several times plus all 48 voices, so the call was cut off inside a
+        // FreeSample at every level reload. The remaining frees never ran, a driver semaphore was left taken (the next
+        // request timed out on it for 1 s) and after a few reloads the 2 MB of sound RAM was full (issue #37).
+        // PS2X_IOP_RPC_BUDGET=<instructions> overrides the budget (2000000 = the old behaviour).
+        static const uint32_t rpcBudget = []() -> uint32_t
+        {
+            if (const char *v = std::getenv("PS2X_IOP_RPC_BUDGET"))
+            {
+                const unsigned long n = std::strtoul(v, nullptr, 0);
+                if (n != 0ul)
+                    return static_cast<uint32_t>(std::min<unsigned long>(n, 0xFFFFFFFFul));
+            }
+            return 400'000'000u; // ~11 s of IOP time: only a server stuck in a loop gets near it
+        }();
+        uint32_t returnPointer = executor.executeGuestFunctionWithBudget(server.function,
+                                                                         request.function,
+                                                                         server.buffer,
+                                                                         request.send.size,
+                                                                         0u,
+                                                                         server.gp,
+                                                                         rpcBudget);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
